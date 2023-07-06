@@ -81,6 +81,8 @@ use blockstack_lib::util::get_epoch_time_ms;
 use blockstack_lib::util::hash::{hex_bytes, to_hex};
 use blockstack_lib::util::log;
 use blockstack_lib::util::retry::LogReader;
+use blockstack_lib::util::secp256k1::Secp256k1PrivateKey;
+use blockstack_lib::util::secp256k1::Secp256k1PublicKey;
 use blockstack_lib::util::sleep_ms;
 use blockstack_lib::util_lib::strings::UrlString;
 use blockstack_lib::{
@@ -113,6 +115,19 @@ fn main() {
                 option_env!("CARGO_PKG_VERSION").unwrap_or("0.0.0.0")
             )
         );
+        process::exit(0);
+    }
+
+    if argv[1] == "peer-pub-key" {
+        if argv.len() < 3 {
+            eprintln!("Usage: {} peer-pub-key <local-peer-seed>", argv[0]);
+            process::exit(1);
+        }
+
+        let local_seed = hex_bytes(&argv[2]).expect("Failed to parse hex input local-peer-seed");
+        let node_privkey = Secp256k1PrivateKey::from_seed(&local_seed);
+        let pubkey = Secp256k1PublicKey::from_private(&node_privkey).to_hex();
+        println!("{}", pubkey);
         process::exit(0);
     }
 
@@ -719,8 +734,8 @@ simulating a miner.
         let sort_db_path = format!("{}/mainnet/burnchain/sortition", &argv[2]);
         let chain_state_path = format!("{}/mainnet/chainstate/", &argv[2]);
 
-        let mut min_fee = u64::max_value();
-        let mut max_time = u64::max_value();
+        let mut min_fee = u64::MAX;
+        let mut max_time = u64::MAX;
 
         if argv.len() >= 4 {
             min_fee = argv[3].parse().expect("Could not parse min_fee");
@@ -1107,11 +1122,7 @@ simulating a miner.
         let burnchain = Burnchain::regtest(&burnchain_db_path);
         let first_burnchain_block_height = burnchain.first_block_height;
         let first_burnchain_block_hash = burnchain.first_block_hash;
-        let epochs = StacksEpoch::all(
-            first_burnchain_block_height,
-            u64::max_value(),
-            u64::max_value(),
-        );
+        let epochs = StacksEpoch::all(first_burnchain_block_height, u64::MAX, u64::MAX);
         let (mut new_sortition_db, _) = burnchain
             .connect_db(
                 true,
@@ -1196,11 +1207,7 @@ simulating a miner.
         let mut known_stacks_blocks = HashSet::new();
         let mut next_arrival = 0;
 
-        let epochs = StacksEpoch::all(
-            first_burnchain_block_height,
-            u64::max_value(),
-            u64::max_value(),
-        );
+        let epochs = StacksEpoch::all(first_burnchain_block_height, u64::MAX, u64::MAX);
 
         let (p2p_new_sortition_db, _) = burnchain
             .connect_db(
