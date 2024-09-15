@@ -1,5 +1,5 @@
-use std::io::{self, BufReader};
-use std::io::{prelude::*, Cursor, Lines};
+use std::io::prelude::*;
+use std::io::{self, BufReader, Cursor, Lines};
 
 use libflate::deflate::{self, Decoder};
 
@@ -129,7 +129,7 @@ fn iter_deflated_csv(deflate_bytes: &'static [u8]) -> Box<dyn Iterator<Item = Ve
     let line_iter = buff_reader
         .lines()
         .map(|line| line.unwrap())
-        .map(|line| line.split(",").map(String::from).collect());
+        .map(|line| line.split(',').map(String::from).collect());
     return Box::new(line_iter);
 }
 

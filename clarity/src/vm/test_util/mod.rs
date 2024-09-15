@@ -1,23 +1,20 @@
-use crate::vm::ast::ASTRules;
-use crate::vm::costs::ExecutionCost;
-use crate::vm::database::{BurnStateDB, HeadersDB};
-use crate::vm::execute as vm_execute;
-use crate::vm::execute_on_network as vm_execute_on_network;
-use crate::vm::representations::SymbolicExpression;
-use crate::vm::types::StandardPrincipalData;
-use crate::vm::types::{PrincipalData, ResponseData, TupleData, Value};
-use crate::vm::StacksEpoch;
 use stacks_common::address::{AddressHashMode, C32_ADDRESS_VERSION_TESTNET_SINGLESIG};
 use stacks_common::consts::{
     BITCOIN_REGTEST_FIRST_BLOCK_HASH, BITCOIN_REGTEST_FIRST_BLOCK_HEIGHT,
     BITCOIN_REGTEST_FIRST_BLOCK_TIMESTAMP, FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH,
 };
-use stacks_common::types::chainstate::ConsensusHash;
 use stacks_common::types::chainstate::{
-    BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksAddress, StacksBlockId, VRFSeed,
+    BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress, StacksBlockId,
+    StacksPrivateKey, StacksPublicKey, VRFSeed,
 };
-use stacks_common::types::chainstate::{StacksPrivateKey, StacksPublicKey};
 use stacks_common::types::{StacksEpochId, PEER_VERSION_EPOCH_2_0};
+
+use crate::vm::ast::ASTRules;
+use crate::vm::costs::ExecutionCost;
+use crate::vm::database::{BurnStateDB, HeadersDB};
+use crate::vm::representations::SymbolicExpression;
+use crate::vm::types::{PrincipalData, ResponseData, StandardPrincipalData, TupleData, Value};
+use crate::vm::{execute as vm_execute, execute_on_network as vm_execute_on_network, StacksEpoch};
 
 pub struct UnitTestBurnStateDB {
     pub epoch_id: StacksEpochId,
@@ -41,6 +38,9 @@ pub const TEST_BURN_STATE_DB_21: UnitTestBurnStateDB = UnitTestBurnStateDB {
 
 pub fn generate_test_burn_state_db(epoch_id: StacksEpochId) -> UnitTestBurnStateDB {
     match epoch_id {
+        StacksEpochId::Epoch10 => {
+            panic!("Epoch 1.0 not testable");
+        }
         StacksEpochId::Epoch20 => UnitTestBurnStateDB {
             epoch_id,
             ast_rules: ASTRules::Typical,
@@ -49,11 +49,12 @@ pub fn generate_test_burn_state_db(epoch_id: StacksEpochId) -> UnitTestBurnState
         | StacksEpochId::Epoch21
         | StacksEpochId::Epoch22
         | StacksEpochId::Epoch23
-        | StacksEpochId::Epoch24 => UnitTestBurnStateDB {
+        | StacksEpochId::Epoch24
+        | StacksEpochId::Epoch25
+        | StacksEpochId::Epoch30 => UnitTestBurnStateDB {
             epoch_id,
             ast_rules: ASTRules::PrecheckSize,
         },
-        _ => panic!("Epoch {} not covered", &epoch_id),
     }
 }
 
@@ -232,7 +233,15 @@ impl BurnStateDB for UnitTestBurnStateDB {
         u32::MAX
     }
 
+    fn get_v3_unlock_height(&self) -> u32 {
+        u32::MAX
+    }
+
     fn get_pox_3_activation_height(&self) -> u32 {
+        u32::MAX
+    }
+
+    fn get_pox_4_activation_height(&self) -> u32 {
         u32::MAX
     }
 

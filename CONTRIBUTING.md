@@ -59,8 +59,8 @@ is responsible for:
 6. Merging the new PR.
 
 For an example of this process, see PRs
-[#3598](https://github.com/stacks-network/stacks-blockchain/pull/3598) and
-[#3626](https://github.com/stacks-network/stacks-blockchain/pull/3626).
+[#3598](https://github.com/stacks-network/stacks-core/pull/3598) and
+[#3626](https://github.com/stacks-network/stacks-core/pull/3626).
 
 
 ### Documentation Updates
@@ -90,6 +90,24 @@ should reference the issue in the commit message. For example:
 ```
 fix: incorporate unlocks in mempool admitter, #3623
 ```
+
+## Recommended developer setup
+### Recommended githooks
+
+It is helpful to set up the pre-commit git hook set up, so that Rust formatting issues are caught before
+you push your code. Follow these instruction to set it up:
+
+1. Rename `.git/hooks/pre-commit.sample` to `.git/hooks/pre-commit`
+2. Change the content of `.git/hooks/pre-commit` to be the following
+```sh
+#!/bin/sh
+git diff --name-only --staged | grep '\.rs$' | xargs -P 8 -I {} rustfmt {} --edition 2021 --check --config group_imports=StdExternalCrate,imports_granularity=Module || (
+  echo 'rustfmt failed: run "cargo fmt-stacks"';
+  exit 1
+)
+```
+3. Make it executable by running `chmod +x .git/hooks/pre-commit`
+   That's it! Now your pre-commit hook should be configured on your local machine.
 
 # Creating and Reviewing PRs
 
@@ -208,7 +226,7 @@ Contributions should not contain `unsafe` blocks if at all possible.
 ## Documentation
 
 * Each file must have a **copyright statement**.
-* Any new non-test modules should have **module-level documentation** explaining what the module does, and how it fits into the blockchain as a whole ([example](https://github.com/stacks-network/stacks-blockchain/blob/4852d6439b473e24705f14b8af637aded33cb422/testnet/stacks-node/src/neon_node.rs#L17)).
+* Any new non-test modules should have **module-level documentation** explaining what the module does, and how it fits into the blockchain as a whole ([example](https://github.com/stacks-network/stacks-core/blob/4852d6439b473e24705f14b8af637aded33cb422/testnet/stacks-node/src/neon_node.rs#L17)).
 * Any new files must have some **top-of-file documentation** that describes what the contained code does, and how it fits into the overall module.
 
 Within the source files, the following **code documentation** standards are expected:
@@ -229,7 +247,7 @@ Within the source files, the following **code documentation** standards are expe
   handle I/O reads and writes in an "outer" function.  The "outer"
   function only does the needful I/O and passes the data into the
   "inner" function.  The "inner" function is often private, whereas
-  the "outer" function is often public. For example, [`inner_try_mine_microblock` and `try_mine_microblock`](https://github.com/stacks-network/stacks-blockchain/blob/4852d6439b473e24705f14b8af637aded33cb422/testnet/stacks-node/src/neon_node.rs#L1148-L1216).
+  the "outer" function is often public. For example, [`inner_try_mine_microblock` and `try_mine_microblock`](https://github.com/stacks-network/stacks-core/blob/4852d6439b473e24705f14b8af637aded33cb422/testnet/stacks-node/src/neon_node.rs#L1148-L1216).
 
 ## Refactoring
 
@@ -263,7 +281,7 @@ Within the source files, the following **code documentation** standards are expe
   does not decode with the allotted resources, then no further
   processing may be done and the data is discarded. For an example, see
   how the parsing functions in the http module use `BoundReader` and
-  `MAX_PAYLOAD_LEN` in [http.rs](https://github.com/stacks-network/stacks-blockchain/blob/4852d6439b473e24705f14b8af637aded33cb422/src/net/http.rs#L2260-L2285).
+  `MAX_PAYLOAD_LEN` in [http.rs](https://github.com/stacks-network/stacks-core/blob/4852d6439b473e24705f14b8af637aded33cb422/src/net/http.rs#L2260-L2285).
 
 * **All network input reception is time-bound.**  Every piece of code that ingests data _from the network_ must impose a maximum amount of time that ingestion can take.  If the data takes too long to arrive, then it must be discarded without any further processing.  There is no time bound for data ingested from disk or passed as an argument; this requirement is meant by the space-bound requirement.
 
@@ -285,7 +303,7 @@ Changes to the peer network should be deployed incrementally and tested by multi
 
 Any PRs that claim to improve performance **must ship with reproducible benchmarks** that accurately measure the improvement.  This data must also be reported in the PR submission.
 
-For an example, see [PR #3075](https://github.com/stacks-network/stacks-blockchain/pull/3075).
+For an example, see [PR #3075](https://github.com/stacks-network/stacks-core/pull/3075).
 
 ## Error Handling
 
@@ -366,19 +384,20 @@ A test should be marked `#[ignore]` if:
 
 ## Formatting
 
-This repository uses the default rustfmt formatting style. PRs will be checked against `rustfmt` and will _fail_ if not
-properly formatted.
+PRs will be checked against `rustfmt` and will _fail_ if not properly formatted.
+Unfortunately, some config options that we require cannot currently be set in `.rustfmt` files, so arguments must be passed via the command line.
+Therefore, we handle `rustfmt` configuration using a Cargo alias: `cargo fmt-stacks`
 
 You can check the formatting locally via:
 
 ```bash
-cargo fmt --all -- --check --config group_imports=StdExternalCrate
+cargo fmt-stacks --check
 ```
 
 You can automatically reformat your commit via:
 
 ```bash
-cargo fmt --all -- --config group_imports=StdExternalCrate
+cargo fmt-stacks
 ```
 
 ## Comments
@@ -578,7 +597,7 @@ Keep in mind that better variable names can reduce the need for comments, e.g.:
 
 # Licensing and contributor license agreement
 
-`stacks-blockchain` is released under the terms of the GPL version 3.  Contributions
+`stacks-core` is released under the terms of the GPL version 3.  Contributions
 that are not licensed under compatible terms will be rejected.  Moreover,
 contributions will not be accepted unless _all_ authors accept the project's
 contributor license agreement.

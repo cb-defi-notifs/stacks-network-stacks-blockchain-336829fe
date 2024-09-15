@@ -13,29 +13,27 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-
+use rand::{thread_rng, RngCore};
 use secp256k1;
-use secp256k1::constants as LibSecp256k1Constants;
-use secp256k1::ecdsa::RecoverableSignature as LibSecp256k1RecoverableSignature;
-use secp256k1::ecdsa::RecoveryId as LibSecp256k1RecoveryID;
-use secp256k1::ecdsa::Signature as LibSecp256k1Signature;
-use secp256k1::Error as LibSecp256k1Error;
-use secp256k1::Message as LibSecp256k1Message;
-use secp256k1::PublicKey as LibSecp256k1PublicKey;
-use secp256k1::Secp256k1;
-use secp256k1::SecretKey as LibSecp256k1PrivateKey;
-
-use crate::types::PrivateKey;
-use crate::types::PublicKey;
-use crate::util::hash::{hex_bytes, to_hex};
-
-use serde::de::Deserialize;
-use serde::de::Error as de_Error;
+use secp256k1::ecdsa::{
+    RecoverableSignature as LibSecp256k1RecoverableSignature, RecoveryId as LibSecp256k1RecoveryID,
+    Signature as LibSecp256k1Signature,
+};
+use secp256k1::{
+    constants as LibSecp256k1Constants, Error as LibSecp256k1Error, Message as LibSecp256k1Message,
+    PublicKey as LibSecp256k1PublicKey, Secp256k1, SecretKey as LibSecp256k1PrivateKey,
+};
+use serde::de::{Deserialize, Error as de_Error};
 use serde::ser::Error as ser_Error;
 use serde::Serialize;
+use wsts::common::Signature as WSTSSignature;
+use wsts::curve::point::{Compressed, Point};
+use wsts::curve::scalar::Scalar;
 
-use rand::thread_rng;
-use rand::RngCore;
+use super::hash::Sha256Sum;
+use crate::impl_byte_array_message_codec;
+use crate::types::{PrivateKey, PublicKey};
+use crate::util::hash::{hex_bytes, to_hex};
 
 // per-thread Secp256k1 context
 thread_local!(static _secp256k1: Secp256k1<secp256k1::All> = Secp256k1::new());
@@ -92,9 +90,7 @@ impl MessageSignature {
         let mut ret_bytes = [0u8; 65];
         let recovery_id_byte = recid.to_i32() as u8; // recovery ID will be 0, 1, 2, or 3
         ret_bytes[0] = recovery_id_byte;
-        for i in 0..64 {
-            ret_bytes[i + 1] = bytes[i];
-        }
+        ret_bytes[1..=64].copy_from_slice(&bytes[..64]);
         MessageSignature(ret_bytes)
     }
 
@@ -106,14 +102,24 @@ impl MessageSignature {
             }
         };
         let mut sig_bytes = [0u8; 64];
-        for i in 0..64 {
-            sig_bytes[i] = self.0[i + 1];
-        }
+        sig_bytes[..64].copy_from_slice(&self.0[1..=64]);
 
         match LibSecp256k1RecoverableSignature::from_compact(&sig_bytes, recid) {
             Ok(sig) => Some(sig),
             Err(_) => None,
         }
+    }
+
+    /// Convert from VRS to RSV
+    pub fn to_rsv(&self) -> Vec<u8> {
+        [&self.0[1..], &self.0[0..1]].concat()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Default for Secp256k1PublicKey {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -140,7 +146,7 @@ impl Secp256k1PublicKey {
 
     pub fn from_private(privk: &Secp256k1PrivateKey) -> Secp256k1PublicKey {
         _secp256k1.with(|ctx| {
-            let pubk = LibSecp256k1PublicKey::from_secret_key(&ctx, &privk.key);
+            let pubk = LibSecp256k1PublicKey::from_secret_key(ctx, &privk.key);
             Secp256k1PublicKey {
                 key: pubk,
                 compressed: privk.compress_public,
@@ -235,7 +241,7 @@ impl PublicKey for Secp256k1PublicKey {
             let secp256k1_sig_standard = secp256k1_sig.to_standard();
 
             // must be low-S
-            let mut secp256k1_sig_low_s = secp256k1_sig_standard.clone();
+            let mut secp256k1_sig_low_s = secp256k1_sig_standard;
             secp256k1_sig_low_s.normalize_s();
             if secp256k1_sig_low_s != secp256k1_sig_standard {
                 return Err("Invalid signature: high-S");
@@ -243,6 +249,12 @@ impl PublicKey for Secp256k1PublicKey {
 
             Ok(true)
         })
+    }
+}
+
+impl Default for Secp256k1PrivateKey {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -264,6 +276,27 @@ impl Secp256k1PrivateKey {
                 Err(_) => {
                     continue;
                 }
+            }
+        }
+    }
+
+    /// Create a Secp256k1PrivateKey from seed bytes by repeatedly
+    ///  SHA256 hashing the seed bytes until a private key is found.
+    ///
+    /// If `seed` is a valid private key, it will be returned without hashing.
+    /// The returned private key's compress_public flag will be `true`
+    pub fn from_seed(seed: &[u8]) -> Secp256k1PrivateKey {
+        let mut re_hashed_seed = Vec::from(seed);
+        loop {
+            if let Ok(mut sk) = Secp256k1PrivateKey::from_slice(&re_hashed_seed[..]) {
+                // set this to true: LocalPeer will be doing this anyways,
+                //  and that's currently the only way this method is used
+                sk.set_compress_public(true);
+                return sk;
+            } else {
+                re_hashed_seed = Sha256Sum::from_data(&re_hashed_seed[..])
+                    .as_bytes()
+                    .to_vec()
             }
         }
     }
@@ -292,7 +325,7 @@ impl Secp256k1PrivateKey {
         match LibSecp256k1PrivateKey::from_slice(&data[0..32]) {
             Ok(privkey_res) => Ok(Secp256k1PrivateKey {
                 key: privkey_res,
-                compress_public: compress_public,
+                compress_public,
             }),
             Err(_e) => Err("Invalid private key: failed to load"),
         }
@@ -312,6 +345,10 @@ impl Secp256k1PrivateKey {
             bytes.push(1);
         }
         to_hex(&bytes)
+    }
+
+    pub fn as_slice(&self) -> &[u8; 32] {
+        self.key.as_ref()
     }
 }
 
@@ -340,8 +377,8 @@ fn secp256k1_pubkey_serialize<S: serde::Serializer>(
     pubk: &LibSecp256k1PublicKey,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let key_hex = to_hex(&pubk.serialize().to_vec());
-    s.serialize_str(&key_hex.as_str())
+    let key_hex = to_hex(&pubk.serialize());
+    s.serialize_str(key_hex.as_str())
 }
 
 fn secp256k1_pubkey_deserialize<'de, D: serde::Deserializer<'de>>(
@@ -350,15 +387,15 @@ fn secp256k1_pubkey_deserialize<'de, D: serde::Deserializer<'de>>(
     let key_hex = String::deserialize(d)?;
     let key_bytes = hex_bytes(&key_hex).map_err(de_Error::custom)?;
 
-    LibSecp256k1PublicKey::from_slice(&key_bytes[..]).map_err(de_Error::custom)
+    LibSecp256k1PublicKey::from_slice(&key_bytes).map_err(de_Error::custom)
 }
 
 fn secp256k1_privkey_serialize<S: serde::Serializer>(
     privk: &LibSecp256k1PrivateKey,
     s: S,
 ) -> Result<S::Ok, S::Error> {
-    let key_hex = to_hex(&privk[..].to_vec());
-    s.serialize_str(&key_hex.as_str())
+    let key_hex = to_hex(&privk[..]);
+    s.serialize_str(key_hex.as_str())
 }
 
 fn secp256k1_privkey_deserialize<'de, D: serde::Deserializer<'de>>(
@@ -404,16 +441,12 @@ pub fn secp256k1_verify(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::util::hash::hex_bytes;
-
     use secp256k1;
-    use secp256k1::PublicKey as LibSecp256k1PublicKey;
-    use secp256k1::Secp256k1;
+    use secp256k1::{PublicKey as LibSecp256k1PublicKey, Secp256k1};
 
-    use crate::util::get_epoch_time_ms;
-    use crate::util::log;
+    use super::*;
+    use crate::util::hash::hex_bytes;
+    use crate::util::{get_epoch_time_ms, log};
 
     struct KeyFixture<I, R> {
         input: I,
@@ -436,7 +469,7 @@ mod tests {
         t1.set_compress_public(false);
         let h_uncomp = t1.to_hex();
 
-        assert!(&h_comp != &h_uncomp);
+        assert!(h_comp != h_uncomp);
         assert_eq!(h_comp.len(), 66);
         assert_eq!(h_uncomp.len(), 64);
 
@@ -456,6 +489,30 @@ mod tests {
         t1.set_compress_public(true);
 
         assert_eq!(Secp256k1PrivateKey::from_hex(&h_comp), Ok(t1));
+    }
+
+    #[test]
+    /// Test the behavior of from_seed using hard-coded values from previous existing integration tests
+    fn sk_from_seed() {
+        let sk = Secp256k1PrivateKey::from_seed(&[2; 32]);
+        assert_eq!(
+            Secp256k1PublicKey::from_private(&sk).to_hex(),
+            "024d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        );
+        assert_eq!(
+            sk.to_hex(),
+            "020202020202020202020202020202020202020202020202020202020202020201"
+        );
+
+        let sk = Secp256k1PrivateKey::from_seed(&[0]);
+        assert_eq!(
+            Secp256k1PublicKey::from_private(&sk).to_hex(),
+            "0243311589af63c2adda04fcd7792c038a05c12a4fe40351b3eb1612ff6b2e5a0e"
+        );
+        assert_eq!(
+            sk.to_hex(),
+            "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d01"
+        );
     }
 
     #[test]
@@ -504,7 +561,7 @@ mod tests {
                 (_, _) => {
                     // either got a key when we didn't expect one, or didn't get a key when we did
                     // expect one.
-                    assert!(false);
+                    assert!(false, "Unexpected result: we either got a key when we didn't expect one, or didn't get a key when we did expect one.");
                 }
             }
         }
@@ -574,18 +631,18 @@ mod tests {
                 (Err(e1), Err(e2)) => assert_eq!(e1, e2),
                 (Err(e1), _) => {
                     test_debug!("Failed to verify signature: {}", e1);
-                    eprintln!(
+                    assert!(
+                        false,
                         "failed fixture (verification: {:?}): {:#?}",
                         &ver_res, &fixture
                     );
-                    assert!(false);
                 }
                 (_, _) => {
-                    eprintln!(
+                    assert!(
+                        false,
                         "failed fixture (verification: {:?}): {:#?}",
                         &ver_res, &fixture
                     );
-                    assert!(false);
                 }
             }
         }
@@ -656,4 +713,83 @@ mod tests {
             runtime_verify - runtime_recover
         );
     }
+
+    /*
+    #[test]
+    fn test_schnorr_signature_serde() {
+        use wsts::traits::Aggregator;
+
+        // Test that an empty conversion fails.
+        let empty_signature = SchnorrSignature::default();
+        assert!(empty_signature.to_wsts_signature().is_none());
+
+        // Generate a random Signature and ensure it successfully converts
+        let mut rng = rand_core::OsRng::default();
+        let msg =
+            "You Idiots! These Are Not Them! You\'ve Captured Their Stunt Doubles!".as_bytes();
+
+        let num_keys = 10;
+        let threshold = 7;
+        let party_key_ids: Vec<Vec<u32>> =
+            vec![vec![0, 1, 2], vec![3, 4], vec![5, 6, 7], vec![8, 9]];
+        let num_parties = party_key_ids.len().try_into().unwrap();
+
+        // Create the parties
+        let mut signers: Vec<wsts::v2::Party> = party_key_ids
+            .iter()
+            .enumerate()
+            .map(|(pid, pkids)| {
+                wsts::v2::Party::new(
+                    pid.try_into().unwrap(),
+                    pkids,
+                    num_parties,
+                    num_keys,
+                    threshold,
+                    &mut rng,
+                )
+            })
+            .collect();
+
+        // Generate an aggregate public key
+        let comms = match wsts::v2::test_helpers::dkg(&mut signers, &mut rng) {
+            Ok(comms) => comms,
+            Err(secret_errors) => {
+                panic!("Got secret errors from DKG: {:?}", secret_errors);
+            }
+        };
+        let aggregate_public_key = comms
+            .iter()
+            .fold(Point::default(), |s, comm| s + comm.poly[0]);
+
+        // signers [0,1,3] have "threshold" keys
+        {
+            let mut signers = [signers[0].clone(), signers[1].clone(), signers[3].clone()].to_vec();
+            let mut sig_agg = wsts::v2::Aggregator::new(num_keys, threshold);
+
+            sig_agg.init(comms.clone()).expect("aggregator init failed");
+
+            let (nonces, sig_shares, key_ids) =
+                wsts::v2::test_helpers::sign(msg, &mut signers, &mut rng);
+            let original_signature = sig_agg
+                .sign(msg, &nonces, &sig_shares, &key_ids)
+                .expect("aggregator sig failed");
+            // Serialize the signature and verify the results
+            let schnorr_signature = SchnorrSignature::from(&original_signature);
+            assert_eq!(
+                schnorr_signature[..33],
+                original_signature.R.compress().data[..]
+            );
+            assert_eq!(schnorr_signature[33..], original_signature.z.to_bytes());
+
+            // Deserialize the signature and verify the results
+            let reverted_signature = schnorr_signature
+                .to_wsts_signature()
+                .expect("Failed to convert schnorr signature to wsts signature");
+            assert_eq!(reverted_signature.R, original_signature.R);
+            assert_eq!(reverted_signature.z, original_signature.z);
+            assert!(original_signature.verify(&aggregate_public_key, msg));
+            assert!(reverted_signature.verify(&aggregate_public_key, msg));
+        }
+    }
+    */
 }

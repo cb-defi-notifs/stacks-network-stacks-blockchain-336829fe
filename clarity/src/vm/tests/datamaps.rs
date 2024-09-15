@@ -14,17 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::vm::contexts::OwnedEnvironment;
-use crate::vm::database::MemoryBackingStore;
-use crate::vm::errors::{CheckErrors, Error, RuntimeErrorType, ShortReturnType};
-use crate::vm::execute;
+use crate::vm::errors::{CheckErrors, Error, ShortReturnType};
 use crate::vm::types::{
-    ListData, QualifiedContractIdentifier, SequenceData, StandardPrincipalData, TupleData,
-    TupleTypeSignature, TypeSignature, Value,
+    ListData, SequenceData, TupleData, TupleTypeSignature, TypeSignature, Value,
 };
-use crate::vm::ClarityName;
-use std::convert::From;
-use std::convert::TryFrom;
+use crate::vm::{execute, ClarityName};
 
 fn assert_executes(expected: Result<Value, Error>, input: &str) {
     assert_eq!(expected.unwrap(), execute(input).unwrap().unwrap());
@@ -498,10 +492,10 @@ fn lists_system_2() {
                     (get-list 1))
         (map-insert lists (tuple (name 1)) (tuple (contentious (list 1 2 6))))";
 
-    match execute(test) {
-        Err(Error::Unchecked(CheckErrors::TypeError(_, _))) => true,
-        _ => false,
-    };
+    matches!(
+        execute(test),
+        Err(Error::Unchecked(CheckErrors::TypeError(_, _)))
+    );
 }
 
 #[test]
@@ -563,12 +557,10 @@ fn lists_system() {
     {
         let test = execute(test);
         println!("{:#?}", test);
-        let expected_type_error = match test {
-            Err(Error::Unchecked(CheckErrors::TypeValueError(_, _))) => true,
-            _ => false,
-        };
-
-        assert!(expected_type_error);
+        assert!(matches!(
+            test,
+            Err(Error::Unchecked(CheckErrors::TypeValueError(_, _)))
+        ));
     }
 }
 

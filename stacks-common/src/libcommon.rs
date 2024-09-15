@@ -5,31 +5,19 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 #![cfg_attr(test, allow(unused_variables, unused_assignments))]
-
-extern crate curve25519_dalek;
-extern crate ed25519_dalek;
-extern crate rand;
-extern crate rusqlite;
-extern crate secp256k1;
-extern crate serde;
-#[macro_use]
-extern crate lazy_static;
-extern crate ripemd;
-extern crate sha2;
-extern crate sha3;
-extern crate time;
+#![allow(clippy::assertions_on_constants)]
 
 #[macro_use(o, slog_log, slog_trace, slog_debug, slog_info, slog_warn, slog_error)]
 extern crate slog;
-extern crate chrono;
-#[cfg(feature = "slog_json")]
-extern crate slog_json;
-extern crate slog_term;
 
 #[macro_use]
 extern crate serde_derive;
-#[macro_use]
-extern crate serde_json;
+
+#[cfg(unix)]
+extern crate nix;
+
+#[cfg(windows)]
+extern crate winapi;
 
 #[macro_use]
 pub mod util;
@@ -43,11 +31,13 @@ pub mod address;
 
 pub mod deps_common;
 
+pub mod bitvec;
+
 use crate::types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, SortitionId, StacksBlockId};
 
 pub mod consts {
-    use crate::types::chainstate::BlockHeaderHash;
-    use crate::types::chainstate::ConsensusHash;
+    use crate::types::chainstate::{BlockHeaderHash, ConsensusHash};
+    pub use crate::types::MINING_COMMITMENT_WINDOW;
 
     pub const TOKEN_TRANSFER_MEMO_LENGTH: usize = 34; // same as it is in Stacks v1
 
@@ -70,4 +60,23 @@ pub mod consts {
     pub const MINER_REWARD_MATURITY: u64 = 100;
 
     pub const STACKS_EPOCH_MAX: u64 = i64::MAX as u64;
+
+    /// The number of StackerDB slots each signing key needs
+    ///  to use to participate in DKG and block validation signing.
+    pub const SIGNER_SLOTS_PER_USER: u32 = 13;
+}
+
+/// This test asserts that the constant above doesn't change.
+/// This exists because the constant above is used by Epoch 2.5 instantiation code.
+///
+/// Adding more slots will require instantiating more .signers contracts through either
+///  consensus changes (i.e., a new epoch) or through non-consensus-critical contract
+///  deployments.
+#[test]
+fn signer_slots_count_2_5() {
+    assert_eq!(
+        consts::SIGNER_SLOTS_PER_USER,
+        13,
+        "The .signers-x-y contracts in Epoch 2.5 were instantiated with 13 slots"
+    );
 }

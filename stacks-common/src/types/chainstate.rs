@@ -1,50 +1,32 @@
 use std::fmt;
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::str::FromStr;
 
 use curve25519_dalek::digest::Digest;
-use sha2::Sha256;
-use sha2::{Digest as Sha2Digest, Sha512_256};
-
-use crate::util::hash::{to_hex, Hash160, Sha512Trunc256Sum, HASH160_ENCODED_SIZE};
-use crate::util::secp256k1::MessageSignature;
-use crate::util::uint::Uint256;
-use crate::util::vrf::VRFProof;
-
-use serde::de::Deserialize;
-use serde::de::Error as de_Error;
+use rand::{Rng, SeedableRng};
+use serde::de::{Deserialize, Error as de_Error};
 use serde::ser::Error as ser_Error;
 use serde::Serialize;
-
-use crate::util::secp256k1::Secp256k1PrivateKey;
-use crate::util::secp256k1::Secp256k1PublicKey;
-use crate::util::vrf::VRF_PROOF_ENCODED_SIZE;
+use sha2::{Digest as Sha2Digest, Sha256, Sha512_256};
 
 use crate::codec::{read_next, write_next, Error as CodecError, StacksMessageCodec};
-
+use crate::consts::{FIRST_BURNCHAIN_CONSENSUS_HASH, FIRST_STACKS_BLOCK_HASH};
 use crate::deps_common::bitcoin::util::hash::Sha256dHash;
-use rand::Rng;
-use rand::SeedableRng;
-use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-
-use crate::util::hash::DoubleSha256;
+use crate::util::hash::{to_hex, DoubleSha256, Hash160, Sha512Trunc256Sum, HASH160_ENCODED_SIZE};
+use crate::util::secp256k1::{MessageSignature, Secp256k1PrivateKey, Secp256k1PublicKey};
+use crate::util::uint::Uint256;
+use crate::util::vrf::{VRFProof, VRF_PROOF_ENCODED_SIZE};
 
 pub type StacksPublicKey = Secp256k1PublicKey;
 pub type StacksPrivateKey = Secp256k1PrivateKey;
 
 /// Hash of a Trie node.  This is a SHA2-512/256.
+#[derive(Default)]
 pub struct TrieHash(pub [u8; 32]);
 impl_array_newtype!(TrieHash, u8, 32);
 impl_array_hexstring_fmt!(TrieHash);
 impl_byte_array_newtype!(TrieHash, u8, 32);
 impl_byte_array_serde!(TrieHash);
-
-impl Default for TrieHash {
-    fn default() -> TrieHash {
-        TrieHash([0x00; 32])
-    }
-}
 
 pub const TRIEHASH_ENCODED_SIZE: usize = 32;
 
@@ -61,6 +43,17 @@ impl_byte_array_newtype!(BlockHeaderHash, u8, 32);
 impl_byte_array_serde!(BlockHeaderHash);
 pub const BLOCK_HEADER_HASH_ENCODED_SIZE: usize = 32;
 
+impl slog::Value for BlockHeaderHash {
+    fn serialize(
+        &self,
+        _record: &slog::Record,
+        key: slog::Key,
+        serializer: &mut dyn slog::Serializer,
+    ) -> slog::Result {
+        serializer.emit_arguments(key, &format_args!("{}", *self))
+    }
+}
+
 /// Identifier used to identify "sortitions" in the
 ///  SortitionDB. A sortition is the collection of
 ///  valid burnchain operations (and any dependent
@@ -70,7 +63,6 @@ pub struct SortitionId(pub [u8; 32]);
 impl_array_newtype!(SortitionId, u8, 32);
 impl_array_hexstring_fmt!(SortitionId);
 impl_byte_array_newtype!(SortitionId, u8, 32);
-impl_byte_array_rusqlite_only!(SortitionId);
 
 pub struct VRFSeed(pub [u8; 32]);
 impl_array_newtype!(VRFSeed, u8, 32);
@@ -96,7 +88,7 @@ impl SortitionId {
 
     pub fn new(bhh: &BurnchainHeaderHash, pox: &PoxId) -> SortitionId {
         if pox == &PoxId::stubbed() {
-            SortitionId(bhh.0.clone())
+            SortitionId(bhh.0)
         } else {
             let mut hasher = Sha512_256::new();
             hasher.update(bhh);
@@ -143,6 +135,10 @@ impl PoxId {
 
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn bit_slice(&self, start: usize, len: usize) -> (Vec<u8>, u64) {
@@ -192,14 +188,12 @@ impl PoxId {
 impl FromStr for PoxId {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut result = vec![];
-        for i in s.chars() {
-            if i == '1' {
-                result.push(true);
-            } else if i == '0' {
-                result.push(false);
-            } else {
-                return Err("Unexpected character in PoX ID serialization");
+        let mut result = Vec::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '0' => result.push(false),
+                '1' => result.push(true),
+                _ => return Err("Unexpected character in PoX ID serialization"),
             }
         }
         Ok(PoxId::new(result))
@@ -232,7 +226,7 @@ impl StacksMessageCodec for StacksAddress {
         let version: u8 = read_next(fd)?;
         let hash160: Hash160 = read_next(fd)?;
         Ok(StacksAddress {
-            version: version,
+            version,
             bytes: hash160,
         })
     }
@@ -251,7 +245,6 @@ pub struct StacksBlockId(pub [u8; 32]);
 impl_array_newtype!(StacksBlockId, u8, 32);
 impl_array_hexstring_fmt!(StacksBlockId);
 impl_byte_array_newtype!(StacksBlockId, u8, 32);
-impl_byte_array_rusqlite_only!(StacksBlockId);
 impl_byte_array_serde!(StacksBlockId);
 
 pub struct ConsensusHash(pub [u8; 20]);
@@ -273,6 +266,10 @@ impl StacksBlockId {
 
         let h = Sha512Trunc256Sum::from_hasher(hasher);
         StacksBlockId(h.0)
+    }
+
+    pub fn first_mined() -> StacksBlockId {
+        StacksBlockId::new(&FIRST_BURNCHAIN_CONSENSUS_HASH, &FIRST_STACKS_BLOCK_HASH)
     }
 }
 
@@ -323,18 +320,6 @@ impl StacksMessageCodec for StacksWorkScore {
     }
 }
 
-// Implement rusqlite traits for a bunch of structs that used to be defined
-//  in the chainstate code
-impl_byte_array_rusqlite_only!(ConsensusHash);
-impl_byte_array_rusqlite_only!(Hash160);
-impl_byte_array_rusqlite_only!(BlockHeaderHash);
-impl_byte_array_rusqlite_only!(VRFSeed);
-impl_byte_array_rusqlite_only!(BurnchainHeaderHash);
-impl_byte_array_rusqlite_only!(VRFProof);
-impl_byte_array_rusqlite_only!(TrieHash);
-impl_byte_array_rusqlite_only!(Sha512Trunc256Sum);
-impl_byte_array_rusqlite_only!(MessageSignature);
-
 impl_byte_array_message_codec!(TrieHash, TRIEHASH_ENCODED_SIZE as u32);
 impl_byte_array_message_codec!(Sha512Trunc256Sum, 32);
 
@@ -350,11 +335,18 @@ impl BlockHeaderHash {
         Hash160::from_sha256(&self.0)
     }
 
+    pub fn from_serializer<C: StacksMessageCodec>(
+        serializer: &C,
+    ) -> Result<BlockHeaderHash, CodecError> {
+        let mut hasher = Sha512_256::new();
+        serializer.consensus_serialize(&mut hasher)?;
+        let hash = Sha512Trunc256Sum::from_hasher(hasher);
+        Ok(BlockHeaderHash(hash.0))
+    }
+
     pub fn from_serialized_header(buf: &[u8]) -> BlockHeaderHash {
         let h = Sha512Trunc256Sum::from_data(buf);
-        let mut b = [0u8; 32];
-        b.copy_from_slice(h.as_bytes());
-        BlockHeaderHash(b)
+        BlockHeaderHash(h.to_bytes())
     }
 }
 
@@ -368,8 +360,7 @@ impl BurnchainHeaderHash {
     }
 
     pub fn to_bitcoin_hash(&self) -> Sha256dHash {
-        let mut bytes = self.0.to_vec();
-        bytes.reverse();
+        let bytes = self.0.iter().rev().copied().collect::<Vec<_>>();
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&bytes[0..32]);
         Sha256dHash(buf)
@@ -390,25 +381,7 @@ impl BurnchainHeaderHash {
         bytes.extend_from_slice(index_root.as_bytes());
         bytes.extend_from_slice(&noise.to_be_bytes());
         let h = DoubleSha256::from_data(&bytes[..]);
-        let mut hb = [0u8; 32];
-        hb.copy_from_slice(h.as_bytes());
-
-        BurnchainHeaderHash(hb)
-    }
-}
-
-impl FromSql for Sha256dHash {
-    fn column_result(value: ValueRef) -> FromSqlResult<Sha256dHash> {
-        let hex_str = value.as_str()?;
-        let hash = Sha256dHash::from_hex(hex_str).map_err(|_e| FromSqlError::InvalidType)?;
-        Ok(hash)
-    }
-}
-
-impl ToSql for Sha256dHash {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput> {
-        let hex_str = self.be_hex_string();
-        Ok(hex_str.into())
+        BurnchainHeaderHash(h.to_bytes())
     }
 }
 

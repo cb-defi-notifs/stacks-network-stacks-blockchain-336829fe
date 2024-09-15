@@ -14,41 +14,24 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::vm::ClarityVersion;
 #[cfg(test)]
 use rstest::rstest;
 #[cfg(test)]
 use rstest_reuse::{self, *};
 use stacks_common::types::StacksEpochId;
 
-use crate::vm::analysis::mem_type_check;
-use crate::vm::analysis::{
-    arithmetic_checker::ArithmeticOnlyChecker, arithmetic_checker::Error,
-    arithmetic_checker::Error::*, ContractAnalysis,
-};
+use crate::vm::analysis::arithmetic_checker::Error::*;
+use crate::vm::analysis::arithmetic_checker::{ArithmeticOnlyChecker, Error};
+use crate::vm::analysis::ContractAnalysis;
 use crate::vm::ast::parse;
 use crate::vm::costs::LimitedCostTracker;
 use crate::vm::functions::define::DefineFunctions;
 use crate::vm::functions::NativeFunctions;
+use crate::vm::tests::test_clarity_versions;
+use crate::vm::tooling::mem_type_check;
 use crate::vm::types::QualifiedContractIdentifier;
 use crate::vm::variables::NativeVariables;
-
-#[template]
-#[rstest]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch2_05)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch24)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch24)]
-fn test_clarity_versions_arith_checker(
-    #[case] version: ClarityVersion,
-    #[case] epoch: StacksEpochId,
-) {
-}
+use crate::vm::ClarityVersion;
 
 /// Checks whether or not a contract only contains arithmetic expressions (for example, defining a
 /// map would not pass this check).
@@ -77,7 +60,7 @@ fn check_good(contract: &str, version: ClarityVersion, epoch: StacksEpochId) {
     ArithmeticOnlyChecker::run(&analysis).expect("Should pass arithmetic checks");
 }
 
-#[apply(test_clarity_versions_arith_checker)]
+#[apply(test_clarity_versions)]
 fn test_bad_defines(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let tests = [
         ("(define-public (foo) (ok 1))", DefineTypeForbidden(DefineFunctions::PublicFunction)),

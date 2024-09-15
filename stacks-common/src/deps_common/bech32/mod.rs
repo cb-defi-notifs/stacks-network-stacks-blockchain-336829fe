@@ -63,14 +63,12 @@ extern crate alloc;
 extern crate core;
 
 #[cfg(all(not(feature = "std"), not(test)))]
-use alloc::{string::String, vec::Vec};
-
-#[cfg(all(not(feature = "std"), not(test)))]
 use alloc::borrow::Cow;
+#[cfg(all(not(feature = "std"), not(test)))]
+use alloc::{string::String, vec::Vec};
+use core::{fmt, mem};
 #[cfg(any(feature = "std", test))]
 use std::borrow::Cow;
-
-use core::{fmt, mem};
 
 /// Integer in the range `0..32`
 #[derive(PartialEq, Eq, Debug, Copy, Clone, Default, PartialOrd, Ord, Hash)]
@@ -376,9 +374,9 @@ fn check_hrp(hrp: &str) -> Result<Case, Error> {
             return Err(Error::InvalidChar(b as char));
         }
 
-        if (b'a'..=b'z').contains(&b) {
+        if b.is_ascii_lowercase() {
             has_lower = true;
-        } else if (b'A'..=b'Z').contains(&b) {
+        } else if b.is_ascii_uppercase() {
             has_upper = true;
         };
 
@@ -601,7 +599,8 @@ fn verify_checksum(hrp: &[u8], data: &[u5]) -> Option<Variant> {
 }
 
 fn hrp_expand(hrp: &[u8]) -> Vec<u5> {
-    let mut v: Vec<u5> = Vec::new();
+    let size = (hrp.len() * 2) + 1;
+    let mut v: Vec<u5> = Vec::with_capacity(size);
     for b in hrp {
         v.push(u5::try_from_u8(*b >> 5).expect("can't be out of range, max. 7"));
     }

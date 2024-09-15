@@ -1,45 +1,54 @@
-use std::convert::TryInto;
-use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::{cmp, fs, thread};
 
+use clarity::vm::costs::ExecutionCost;
+use clarity::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier};
+use lazy_static::lazy_static;
 use rand::RngCore;
-
+use serde::Deserialize;
+use stacks::burnchains::affirmation::AffirmationMap;
 use stacks::burnchains::bitcoin::BitcoinNetworkType;
-use stacks::burnchains::Burnchain;
-use stacks::burnchains::{MagicBytes, BLOCKSTACK_MAGIC_MAINNET};
+use stacks::burnchains::{Burnchain, MagicBytes, PoxConstants, BLOCKSTACK_MAGIC_MAINNET};
+use stacks::chainstate::nakamoto::signer_set::NakamotoSigners;
+use stacks::chainstate::stacks::boot::MINERS_NAME;
 use stacks::chainstate::stacks::index::marf::MARFOpenOpts;
 use stacks::chainstate::stacks::index::storage::TrieHashCalculationMode;
-use stacks::chainstate::stacks::miner::BlockBuilderSettings;
-use stacks::chainstate::stacks::miner::MinerStatus;
+use stacks::chainstate::stacks::miner::{BlockBuilderSettings, MinerStatus};
 use stacks::chainstate::stacks::MAX_BLOCK_LEN;
-use stacks::core::mempool::MemPoolWalkSettings;
-use stacks::core::StacksEpoch;
-use stacks::core::StacksEpochExtension;
-use stacks::core::StacksEpochId;
+use stacks::core::mempool::{MemPoolWalkSettings, MemPoolWalkTxTypes};
 use stacks::core::{
-    CHAIN_ID_MAINNET, CHAIN_ID_TESTNET, PEER_VERSION_MAINNET, PEER_VERSION_TESTNET,
+    MemPoolDB, StacksEpoch, StacksEpochExtension, StacksEpochId,
+    BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT, BITCOIN_TESTNET_STACKS_25_BURN_HEIGHT,
+    BITCOIN_TESTNET_STACKS_25_REORGED_HEIGHT, CHAIN_ID_MAINNET, CHAIN_ID_TESTNET,
+    PEER_VERSION_MAINNET, PEER_VERSION_TESTNET,
 };
 use stacks::cost_estimates::fee_medians::WeightedMedianFeeRateEstimator;
 use stacks::cost_estimates::fee_rate_fuzzer::FeeRateFuzzer;
 use stacks::cost_estimates::fee_scalar::ScalarFeeRateEstimator;
-use stacks::cost_estimates::metrics::CostMetric;
-use stacks::cost_estimates::metrics::ProportionalDotProduct;
-use stacks::cost_estimates::CostEstimator;
-use stacks::cost_estimates::FeeEstimator;
-use stacks::cost_estimates::PessimisticEstimator;
+use stacks::cost_estimates::metrics::{CostMetric, ProportionalDotProduct, UnitMetric};
+use stacks::cost_estimates::{CostEstimator, FeeEstimator, PessimisticEstimator, UnitEstimator};
+use stacks::net::atlas::AtlasConfig;
 use stacks::net::connection::ConnectionOptions;
-use stacks::net::{Neighbor, NeighborKey, PeerAddress};
-use stacks::util::get_epoch_time_ms;
-use stacks::util::hash::hex_bytes;
-use stacks::util::secp256k1::Secp256k1PrivateKey;
-use stacks::util::secp256k1::Secp256k1PublicKey;
-use stacks::vm::costs::ExecutionCost;
-use stacks::vm::types::{AssetIdentifier, PrincipalData, QualifiedContractIdentifier};
+use stacks::net::{Neighbor, NeighborKey};
+use stacks::types::chainstate::BurnchainHeaderHash;
+use stacks::util_lib::boot::boot_code_id;
+use stacks::util_lib::db::Error as DBError;
+use stacks_common::consts::SIGNER_SLOTS_PER_USER;
+use stacks_common::types::chainstate::StacksAddress;
+use stacks_common::types::net::PeerAddress;
+use stacks_common::types::Address;
+use stacks_common::util::get_epoch_time_ms;
+use stacks_common::util::hash::hex_bytes;
+use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
 
-const DEFAULT_SATS_PER_VB: u64 = 50;
+use crate::chain_data::MinerStats;
+
+pub const DEFAULT_SATS_PER_VB: u64 = 50;
 const DEFAULT_MAX_RBF_RATE: u64 = 150; // 1.5x
 const DEFAULT_RBF_FEE_RATE_INCREMENT: u64 = 5;
 const LEADER_KEY_TX_ESTIM_SIZE: u64 = 290;
@@ -48,13 +57,15 @@ const INV_REWARD_CYCLES_TESTNET: u64 = 6;
 
 #[derive(Clone, Deserialize, Default, Debug)]
 pub struct ConfigFile {
+    pub __path: Option<String>, // Only used for config file reloads
     pub burnchain: Option<BurnchainConfigFile>,
     pub node: Option<NodeConfigFile>,
     pub ustx_balance: Option<Vec<InitialBalanceFile>>,
-    pub events_observer: Option<Vec<EventObserverConfigFile>>,
+    pub events_observer: Option<HashSet<EventObserverConfigFile>>,
     pub connection_options: Option<ConnectionOptionsFile>,
     pub fee_estimation: Option<FeeEstimationConfigFile>,
     pub miner: Option<MinerConfigFile>,
+    pub atlas: Option<AtlasConfigFile>,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -90,7 +101,8 @@ mod tests {
                     seed = "invalid-hex-value"
                     "#,
                 )
-                .unwrap()
+                .unwrap(),
+                false
             )
             .unwrap_err()
         );
@@ -104,7 +116,8 @@ mod tests {
                     local_peer_seed = "invalid-hex-value"
                     "#,
                 )
-                .unwrap()
+                .unwrap(),
+                false
             )
             .unwrap_err()
         );
@@ -119,6 +132,7 @@ mod tests {
                 "#,
             )
             .unwrap(),
+            false,
         )
         .unwrap_err();
         assert_eq!(
@@ -126,7 +140,7 @@ mod tests {
             &actual_err_msg[..expected_err_prefix.len()]
         );
 
-        assert!(Config::from_config_file(ConfigFile::from_str("").unwrap()).is_ok());
+        assert!(Config::from_config_file(ConfigFile::from_str("").unwrap(), false).is_ok());
     }
 
     #[test]
@@ -173,12 +187,132 @@ mod tests {
             "ST2TFVBMRPS5SSNP98DQKQ5JNB2B6NZM91C4K3P7B"
         );
     }
+
+    #[test]
+    fn should_load_block_proposal_token() {
+        let config = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                [connection_options]
+                block_proposal_token = "password"
+                "#,
+            )
+            .unwrap(),
+            false,
+        )
+        .expect("Expected to be able to parse block proposal token from file");
+
+        assert_eq!(
+            config.connection_options.block_proposal_token,
+            Some("password".to_string())
+        );
+    }
+
+    #[test]
+    fn should_load_affirmation_map() {
+        let affirmation_string = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpa";
+        let affirmation =
+            AffirmationMap::decode(affirmation_string).expect("Failed to decode affirmation map");
+        let config = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                    [[burnchain.affirmation_overrides]]
+                    reward_cycle = 413
+                    affirmation = "{affirmation_string}"
+                "#
+            ))
+            .expect("Expected to be able to parse config file from string"),
+            false,
+        )
+        .expect("Expected to be able to parse affirmation map from file");
+
+        assert_eq!(config.burnchain.affirmation_overrides.len(), 1);
+        assert_eq!(config.burnchain.affirmation_overrides.get(&0), None);
+        assert_eq!(
+            config.burnchain.affirmation_overrides.get(&413),
+            Some(&affirmation)
+        );
+    }
+
+    #[test]
+    fn should_fail_to_load_invalid_affirmation_map() {
+        let bad_affirmation_string = "bad_map";
+        let file = ConfigFile::from_str(&format!(
+            r#"
+                    [[burnchain.affirmation_overrides]]
+                    reward_cycle = 1
+                    affirmation = "{bad_affirmation_string}"
+                "#
+        ))
+        .expect("Expected to be able to parse config file from string");
+
+        assert!(Config::from_config_file(file, false).is_err());
+    }
+
+    #[test]
+    fn should_load_empty_affirmation_map() {
+        let config = Config::from_config_file(
+            ConfigFile::from_str(r#""#)
+                .expect("Expected to be able to parse config file from string"),
+            false,
+        )
+        .expect("Expected to be able to parse affirmation map from file");
+
+        assert!(config.burnchain.affirmation_overrides.is_empty());
+    }
+
+    #[test]
+    fn should_include_xenon_default_affirmation_overrides() {
+        let config = Config::from_config_file(
+            ConfigFile::from_str(
+                r#"
+                [burnchain]
+                chain = "bitcoin"
+                mode = "xenon"
+                "#,
+            )
+            .expect("Expected to be able to parse config file from string"),
+            false,
+        )
+        .expect("Expected to be able to parse affirmation map from file");
+        // Should default add xenon affirmation overrides
+        assert_eq!(config.burnchain.affirmation_overrides.len(), 5);
+    }
+
+    #[test]
+    fn should_override_xenon_default_affirmation_overrides() {
+        let affirmation_string = "aaapnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpa";
+        let affirmation =
+            AffirmationMap::decode(affirmation_string).expect("Failed to decode affirmation map");
+
+        let config = Config::from_config_file(
+            ConfigFile::from_str(&format!(
+                r#"
+                [burnchain]
+                chain = "bitcoin"
+                mode = "xenon"
+
+                [[burnchain.affirmation_overrides]]
+                reward_cycle = 413
+                affirmation = "{affirmation_string}"
+                "#,
+            ))
+            .expect("Expected to be able to parse config file from string"),
+            false,
+        )
+        .expect("Expected to be able to parse affirmation map from file");
+        // Should default add xenon affirmation overrides, but overwrite with the configured one above
+        assert_eq!(config.burnchain.affirmation_overrides.len(), 5);
+        assert_eq!(config.burnchain.affirmation_overrides[&413], affirmation);
+    }
 }
 
 impl ConfigFile {
     pub fn from_path(path: &str) -> Result<ConfigFile, String> {
         let content = fs::read_to_string(path).map_err(|e| format!("Invalid path: {}", &e))?;
-        Self::from_str(&content)
+        let mut f = Self::from_str(&content)?;
+        f.__path = Some(path.to_string());
+        Ok(f)
     }
 
     pub fn from_str(content: &str) -> Result<ConfigFile, String> {
@@ -196,18 +330,21 @@ impl ConfigFile {
     }
 
     pub fn xenon() -> ConfigFile {
-        let burnchain = BurnchainConfigFile {
+        let mut burnchain = BurnchainConfigFile {
             mode: Some("xenon".to_string()),
             rpc_port: Some(18332),
             peer_port: Some(18333),
-            peer_host: Some("bitcoind.xenon.blockstack.org".to_string()),
+            peer_host: Some("bitcoind.testnet.stacks.co".to_string()),
             magic_bytes: Some("T2".into()),
             ..BurnchainConfigFile::default()
         };
 
+        burnchain.add_affirmation_overrides_xenon();
+
         let node = NodeConfigFile {
-            bootstrap_node: Some("029266faff4c8e0ca4f934f34996a96af481df94a89b0c9bd515f3536a95682ddc@seed.testnet.hiro.so:20444".to_string()),
+            bootstrap_node: Some("029266faff4c8e0ca4f934f34996a96af481df94a89b0c9bd515f3536a95682ddc@seed.testnet.hiro.so:30444".to_string()),
             miner: Some(false),
+            stacker: Some(false),
             ..NodeConfigFile::default()
         };
 
@@ -251,8 +388,9 @@ impl ConfigFile {
         };
 
         let node = NodeConfigFile {
-            bootstrap_node: Some("02196f005965cebe6ddc3901b7b1cc1aa7a88f305bb8c5893456b8f9a605923893@seed.mainnet.hiro.so:20444".to_string()),
+            bootstrap_node: Some("02196f005965cebe6ddc3901b7b1cc1aa7a88f305bb8c5893456b8f9a605923893@seed.mainnet.hiro.so:20444,02539449ad94e6e6392d8c1deb2b4e61f80ae2a18964349bc14336d8b903c46a8c@cet.stacksnodes.org:20444,02ececc8ce79b8adf813f13a0255f8ae58d4357309ba0cedd523d9f1a306fcfb79@sgt.stacksnodes.org:20444,0303144ba518fe7a0fb56a8a7d488f950307a4330f146e1e1458fc63fb33defe96@est.stacksnodes.org:20444".to_string()),
             miner: Some(false),
+            stacker: Some(false),
             ..NodeConfigFile::default()
         };
 
@@ -289,6 +427,7 @@ impl ConfigFile {
 
         let node = NodeConfigFile {
             miner: Some(false),
+            stacker: Some(false),
             ..NodeConfigFile::default()
         };
 
@@ -308,6 +447,7 @@ impl ConfigFile {
 
         let node = NodeConfigFile {
             miner: Some(false),
+            stacker: Some(false),
             ..NodeConfigFile::default()
         };
 
@@ -353,13 +493,15 @@ impl ConfigFile {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub config_path: Option<String>,
     pub burnchain: BurnchainConfig,
     pub node: NodeConfig,
     pub initial_balances: Vec<InitialBalance>,
-    pub events_observers: Vec<EventObserverConfig>,
+    pub events_observers: HashSet<EventObserverConfig>,
     pub connection_options: ConnectionOptions,
     pub miner: MinerConfig,
     pub estimation: FeeEstimationConfig,
+    pub atlas: AtlasConfig,
 }
 
 lazy_static! {
@@ -394,10 +536,89 @@ lazy_static! {
 }
 
 impl Config {
+    /// get the up-to-date burnchain options from the config.
+    /// If the config file can't be loaded, then return the existing config
+    pub fn get_burnchain_config(&self) -> BurnchainConfig {
+        let Some(path) = &self.config_path else {
+            return self.burnchain.clone();
+        };
+        let Ok(config_file) = ConfigFile::from_path(path.as_str()) else {
+            return self.burnchain.clone();
+        };
+        let Ok(config) = Config::from_config_file(config_file, false) else {
+            return self.burnchain.clone();
+        };
+        config.burnchain
+    }
+
+    /// get the up-to-date miner options from the config
+    /// If the config can't be loaded for some reason, then return the existing config
+    pub fn get_miner_config(&self) -> MinerConfig {
+        let Some(path) = &self.config_path else {
+            return self.miner.clone();
+        };
+        let Ok(config_file) = ConfigFile::from_path(path.as_str()) else {
+            return self.miner.clone();
+        };
+        let Ok(config) = Config::from_config_file(config_file, false) else {
+            return self.miner.clone();
+        };
+        return config.miner;
+    }
+
+    pub fn get_node_config(&self, resolve_bootstrap_nodes: bool) -> NodeConfig {
+        let Some(path) = &self.config_path else {
+            return self.node.clone();
+        };
+        let Ok(config_file) = ConfigFile::from_path(path.as_str()) else {
+            return self.node.clone();
+        };
+        let Ok(config) = Config::from_config_file(config_file, resolve_bootstrap_nodes) else {
+            return self.node.clone();
+        };
+        return config.node;
+    }
+
     /// Apply any test settings to this burnchain config struct
+    #[cfg_attr(test, mutants::skip)]
     fn apply_test_settings(&self, burnchain: &mut Burnchain) {
         if self.burnchain.get_bitcoin_network().1 == BitcoinNetworkType::Mainnet {
             return;
+        }
+
+        if let Some(first_burn_block_height) = self.burnchain.first_burn_block_height {
+            debug!(
+                "Override first_block_height from {} to {}",
+                burnchain.first_block_height, first_burn_block_height
+            );
+            burnchain.first_block_height = first_burn_block_height;
+        }
+
+        if let Some(first_burn_block_timestamp) = self.burnchain.first_burn_block_timestamp {
+            debug!(
+                "Override first_block_timestamp from {} to {}",
+                burnchain.first_block_timestamp, first_burn_block_timestamp
+            );
+            burnchain.first_block_timestamp = first_burn_block_timestamp;
+        }
+
+        if let Some(first_burn_block_hash) = &self.burnchain.first_burn_block_hash {
+            debug!(
+                "Override first_burn_block_hash from {} to {}",
+                burnchain.first_block_hash, first_burn_block_hash
+            );
+            burnchain.first_block_hash = BurnchainHeaderHash::from_hex(&first_burn_block_hash)
+                .expect("Invalid first_burn_block_hash");
+        }
+
+        if let Some(pox_prepare_length) = self.burnchain.pox_prepare_length {
+            debug!("Override pox_prepare_length to {pox_prepare_length}");
+            burnchain.pox_constants.prepare_length = pox_prepare_length;
+        }
+
+        if let Some(pox_reward_length) = self.burnchain.pox_reward_length {
+            debug!("Override pox_reward_length to {pox_reward_length}");
+            burnchain.pox_constants.reward_cycle_length = pox_reward_length;
         }
 
         if let Some(v1_unlock_height) = self.burnchain.pox_2_activation {
@@ -409,7 +630,41 @@ impl Config {
         }
 
         if let Some(epochs) = &self.burnchain.epochs {
-            // Iterate through the epochs vector and find the item where epoch_id == StacksEpochId::Epoch22
+            if let Some(epoch) = epochs
+                .iter()
+                .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch10)
+            {
+                // Epoch 1.0 start height can be equal to the first block height iff epoch 2.0
+                // start height is also equal to the first block height.
+                assert!(
+                    epoch.start_height <= burnchain.first_block_height,
+                    "FATAL: Epoch 1.0 start height must be at or before the first block height"
+                );
+            }
+
+            if let Some(epoch) = epochs
+                .iter()
+                .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch20)
+            {
+                assert_eq!(
+                    epoch.start_height, burnchain.first_block_height,
+                    "FATAL: Epoch 2.0 start height must match the first block height"
+                );
+            }
+
+            if let Some(epoch) = epochs
+                .iter()
+                .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch21)
+            {
+                // Override v1_unlock_height to the start_height of epoch2.1
+                debug!(
+                    "Override v2_unlock_height from {} to {}",
+                    burnchain.pox_constants.v1_unlock_height,
+                    epoch.start_height + 1
+                );
+                burnchain.pox_constants.v1_unlock_height = epoch.start_height as u32 + 1;
+            }
+
             if let Some(epoch) = epochs
                 .iter()
                 .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch22)
@@ -434,6 +689,19 @@ impl Config {
                 );
                 burnchain.pox_constants.pox_3_activation_height = epoch.start_height as u32;
             }
+
+            if let Some(epoch) = epochs
+                .iter()
+                .find(|epoch| epoch.epoch_id == StacksEpochId::Epoch25)
+            {
+                // Override pox_4_activation_height to the start_height of epoch2.5
+                debug!(
+                    "Override pox_4_activation_height from {} to {}",
+                    burnchain.pox_constants.pox_4_activation_height, epoch.start_height
+                );
+                burnchain.pox_constants.pox_4_activation_height = epoch.start_height as u32;
+                burnchain.pox_constants.v3_unlock_height = epoch.start_height as u32 + 1;
+            }
         }
 
         if let Some(sunset_start) = self.burnchain.sunset_start {
@@ -451,6 +719,54 @@ impl Config {
             );
             burnchain.pox_constants.sunset_end = sunset_end.into();
         }
+
+        // check if the Epoch 3.0 burnchain settings as configured are going to be valid.
+        self.check_nakamoto_config(&burnchain);
+    }
+
+    fn check_nakamoto_config(&self, burnchain: &Burnchain) {
+        let epochs = StacksEpoch::get_epochs(
+            self.burnchain.get_bitcoin_network().1,
+            self.burnchain.epochs.as_ref(),
+        );
+        let Some(epoch_30) = StacksEpoch::find_epoch_by_id(&epochs, StacksEpochId::Epoch30)
+            .map(|epoch_ix| epochs[epoch_ix].clone())
+        else {
+            // no Epoch 3.0, so just return
+            return;
+        };
+        if burnchain.pox_constants.prepare_length < 3 {
+            panic!(
+                "FATAL: Nakamoto rules require a prepare length >= 3. Prepare length set to {}",
+                burnchain.pox_constants.prepare_length
+            );
+        }
+        if burnchain.is_in_prepare_phase(epoch_30.start_height) {
+            panic!(
+                "FATAL: Epoch 3.0 must start *during* a reward phase, not a prepare phase. Epoch 3.0 start set to: {}. PoX Parameters: {:?}",
+                epoch_30.start_height,
+                &burnchain.pox_constants
+            );
+        }
+    }
+
+    /// Connect to the MempoolDB using the configured cost estimation
+    pub fn connect_mempool_db(&self) -> Result<MemPoolDB, DBError> {
+        // create estimators, metric instances for RPC handler
+        let cost_estimator = self
+            .make_cost_estimator()
+            .unwrap_or_else(|| Box::new(UnitEstimator));
+        let metric = self
+            .make_cost_metric()
+            .unwrap_or_else(|| Box::new(UnitMetric));
+
+        MemPoolDB::open(
+            self.is_mainnet(),
+            self.burnchain.chain_id,
+            &self.get_chainstate_path_str(),
+            cost_estimator,
+            metric,
+        )
     }
 
     /// Load up a Burnchain and apply config settings to it.
@@ -541,6 +857,10 @@ impl Config {
                 Ok(StacksEpochId::Epoch23)
             } else if epoch_name == EPOCH_CONFIG_2_4_0 {
                 Ok(StacksEpochId::Epoch24)
+            } else if epoch_name == EPOCH_CONFIG_2_5_0 {
+                Ok(StacksEpochId::Epoch25)
+            } else if epoch_name == EPOCH_CONFIG_3_0_0 {
+                Ok(StacksEpochId::Epoch30)
             } else {
                 Err(format!("Unknown epoch name specified: {}", epoch_name))
             }?;
@@ -557,7 +877,6 @@ impl Config {
             );
         }
 
-        // epochs must be a prefix of [1.0, 2.0, 2.05, 2.1]
         let expected_list = [
             StacksEpochId::Epoch10,
             StacksEpochId::Epoch20,
@@ -566,6 +885,8 @@ impl Config {
             StacksEpochId::Epoch22,
             StacksEpochId::Epoch23,
             StacksEpochId::Epoch24,
+            StacksEpochId::Epoch25,
+            StacksEpochId::Epoch30,
         ];
         for (expected_epoch, configured_epoch) in expected_list
             .iter()
@@ -628,293 +949,41 @@ impl Config {
         Ok(out_epochs)
     }
 
-    pub fn from_config_file(config_file: ConfigFile) -> Result<Config, String> {
-        let default_node_config = NodeConfig::default();
-        let mut has_require_affirmed_anchor_blocks = false;
-        let (mut node, bootstrap_node, deny_nodes) = match config_file.node {
-            Some(node) => {
-                let rpc_bind = node.rpc_bind.unwrap_or(default_node_config.rpc_bind);
-                let node_config = NodeConfig {
-                    name: node.name.unwrap_or(default_node_config.name),
-                    seed: match node.seed {
-                        Some(seed) => hex_bytes(&seed)
-                            .map_err(|_e| format!("node.seed should be a hex encoded string"))?,
-                        None => default_node_config.seed,
-                    },
-                    working_dir: std::env::var("STACKS_WORKING_DIR")
-                        .unwrap_or(node.working_dir.unwrap_or(default_node_config.working_dir)),
-                    rpc_bind: rpc_bind.clone(),
-                    p2p_bind: node.p2p_bind.unwrap_or(default_node_config.p2p_bind),
-                    p2p_address: node.p2p_address.unwrap_or(rpc_bind.clone()),
-                    bootstrap_node: vec![],
-                    deny_nodes: vec![],
-                    data_url: match node.data_url {
-                        Some(data_url) => data_url,
-                        None => format!("http://{}", rpc_bind),
-                    },
-                    local_peer_seed: match node.local_peer_seed {
-                        Some(seed) => hex_bytes(&seed).map_err(|_e| {
-                            format!("node.local_peer_seed should be a hex encoded string")
-                        })?,
-                        None => default_node_config.local_peer_seed,
-                    },
-                    miner: node.miner.unwrap_or(default_node_config.miner),
-                    mock_mining: node.mock_mining.unwrap_or(default_node_config.mock_mining),
-                    mine_microblocks: node
-                        .mine_microblocks
-                        .unwrap_or(default_node_config.mine_microblocks),
-                    microblock_frequency: node
-                        .microblock_frequency
-                        .unwrap_or(default_node_config.microblock_frequency),
-                    max_microblocks: node
-                        .max_microblocks
-                        .unwrap_or(default_node_config.max_microblocks),
-                    wait_time_for_microblocks: node
-                        .wait_time_for_microblocks
-                        .unwrap_or(default_node_config.wait_time_for_microblocks),
-                    wait_time_for_blocks: node
-                        .wait_time_for_blocks
-                        .unwrap_or(default_node_config.wait_time_for_blocks),
-                    prometheus_bind: node.prometheus_bind,
-                    marf_cache_strategy: node.marf_cache_strategy,
-                    marf_defer_hashing: node
-                        .marf_defer_hashing
-                        .unwrap_or(default_node_config.marf_defer_hashing),
-                    pox_sync_sample_secs: node
-                        .pox_sync_sample_secs
-                        .unwrap_or(default_node_config.pox_sync_sample_secs),
-                    use_test_genesis_chainstate: node.use_test_genesis_chainstate,
-                    always_use_affirmation_maps: node
-                        .always_use_affirmation_maps
-                        .unwrap_or(default_node_config.always_use_affirmation_maps),
-                    // miners should always try to mine, even if they don't have the anchored
-                    // blocks in the canonical affirmation map. Followers, however, can stall.
-                    require_affirmed_anchor_blocks: match node.require_affirmed_anchor_blocks {
-                        Some(x) => {
-                            has_require_affirmed_anchor_blocks = true;
-                            x
-                        }
-                        None => {
-                            has_require_affirmed_anchor_blocks = false;
-                            !node.miner.unwrap_or(!default_node_config.miner)
-                        }
-                    },
-                    // chainstate fault_injection activation for hide_blocks.
-                    // you can't set this in the config file.
-                    fault_injection_hide_blocks: false,
-                    chain_liveness_poll_time_secs: node
-                        .chain_liveness_poll_time_secs
-                        .unwrap_or(default_node_config.chain_liveness_poll_time_secs),
-                };
-                (node_config, node.bootstrap_node, node.deny_nodes)
-            }
-            None => (default_node_config, None, None),
-        };
+    pub fn from_config_file(
+        config_file: ConfigFile,
+        resolve_bootstrap_nodes: bool,
+    ) -> Result<Config, String> {
+        Self::from_config_default(config_file, Config::default(), resolve_bootstrap_nodes)
+    }
 
-        let default_burnchain_config = BurnchainConfig::default();
+    fn from_config_default(
+        config_file: ConfigFile,
+        default: Config,
+        resolve_bootstrap_nodes: bool,
+    ) -> Result<Config, String> {
+        let Config {
+            node: default_node_config,
+            burnchain: default_burnchain_config,
+            miner: miner_default_config,
+            estimation: default_estimator,
+            ..
+        } = default;
 
+        // First parse the burnchain config
         let burnchain = match config_file.burnchain {
-            Some(mut burnchain) => {
-                if burnchain.mode.as_deref() == Some("xenon") {
-                    if burnchain.magic_bytes.is_none() {
-                        burnchain.magic_bytes = ConfigFile::xenon().burnchain.unwrap().magic_bytes;
-                    }
-                }
-
-                let burnchain_mode = burnchain.mode.unwrap_or(default_burnchain_config.mode);
-
-                if &burnchain_mode == "mainnet" {
-                    // check magic bytes and set if not defined
-                    let mainnet_magic = ConfigFile::mainnet().burnchain.unwrap().magic_bytes;
-                    if burnchain.magic_bytes.is_none() {
-                        burnchain.magic_bytes = mainnet_magic.clone();
-                    }
-                    if burnchain.magic_bytes != mainnet_magic {
-                        return Err(format!(
-                            "Attempted to run mainnet node with bad magic bytes '{}'",
-                            burnchain.magic_bytes.as_ref().unwrap()
-                        ));
-                    }
-                    if node.use_test_genesis_chainstate == Some(true) {
-                        return Err(format!(
-                            "Attempted to run mainnet node with `use_test_genesis_chainstate`"
-                        ));
-                    }
-                    if let Some(ref balances) = config_file.ustx_balance {
-                        if balances.len() > 0 {
-                            return Err(format!(
-                                "Attempted to run mainnet node with specified `initial_balances`"
-                            ));
-                        }
-                    }
-                } else {
-                    // testnet requires that we use the 2.05 rules for anchor block affirmations,
-                    // because reward cycle 360 (and possibly future ones) has a different anchor
-                    // block choice in 2.05 rules than in 2.1 rules.
-                    if !has_require_affirmed_anchor_blocks {
-                        debug!("Set `require_affirmed_anchor_blocks` to `false` for non-mainnet config");
-                        node.require_affirmed_anchor_blocks = false;
-                    }
-                }
-
-                let mut result = BurnchainConfig {
-                    chain: burnchain.chain.unwrap_or(default_burnchain_config.chain),
-                    chain_id: if &burnchain_mode == "mainnet" {
-                        CHAIN_ID_MAINNET
-                    } else {
-                        CHAIN_ID_TESTNET
-                    },
-                    peer_version: if &burnchain_mode == "mainnet" {
-                        PEER_VERSION_MAINNET
-                    } else {
-                        PEER_VERSION_TESTNET
-                    },
-                    mode: burnchain_mode,
-                    burn_fee_cap: burnchain
-                        .burn_fee_cap
-                        .unwrap_or(default_burnchain_config.burn_fee_cap),
-                    commit_anchor_block_within: burnchain
-                        .commit_anchor_block_within
-                        .unwrap_or(default_burnchain_config.commit_anchor_block_within),
-                    peer_host: match burnchain.peer_host {
-                        Some(peer_host) => {
-                            // Using std::net::LookupHost would be preferable, but it's
-                            // unfortunately unstable at this point.
-                            // https://doc.rust-lang.org/1.6.0/std/net/struct.LookupHost.html
-                            let mut sock_addrs = format!("{}:1", &peer_host)
-                                .to_socket_addrs()
-                                .map_err(|e| format!("Invalid burnchain.peer_host: {}", &e))?;
-                            let sock_addr = match sock_addrs.next() {
-                                Some(addr) => addr,
-                                None => {
-                                    return Err(format!(
-                                        "No IP address could be queried for '{}'",
-                                        &peer_host
-                                    ));
-                                }
-                            };
-                            format!("{}", sock_addr.ip())
-                        }
-                        None => default_burnchain_config.peer_host,
-                    },
-                    peer_port: burnchain
-                        .peer_port
-                        .unwrap_or(default_burnchain_config.peer_port),
-                    rpc_port: burnchain
-                        .rpc_port
-                        .unwrap_or(default_burnchain_config.rpc_port),
-                    rpc_ssl: burnchain
-                        .rpc_ssl
-                        .unwrap_or(default_burnchain_config.rpc_ssl),
-                    username: burnchain.username,
-                    password: burnchain.password,
-                    timeout: burnchain
-                        .timeout
-                        .unwrap_or(default_burnchain_config.timeout),
-                    magic_bytes: burnchain
-                        .magic_bytes
-                        .map(|magic_ascii| {
-                            assert_eq!(magic_ascii.len(), 2, "Magic bytes must be length-2");
-                            assert!(magic_ascii.is_ascii(), "Magic bytes must be ASCII");
-                            MagicBytes::from(magic_ascii.as_bytes())
-                        })
-                        .unwrap_or(default_burnchain_config.magic_bytes),
-                    local_mining_public_key: burnchain.local_mining_public_key,
-                    process_exit_at_block_height: burnchain.process_exit_at_block_height,
-                    poll_time_secs: burnchain
-                        .poll_time_secs
-                        .unwrap_or(default_burnchain_config.poll_time_secs),
-                    satoshis_per_byte: burnchain
-                        .satoshis_per_byte
-                        .unwrap_or(default_burnchain_config.satoshis_per_byte),
-                    max_rbf: burnchain
-                        .max_rbf
-                        .unwrap_or(default_burnchain_config.max_rbf),
-                    leader_key_tx_estimated_size: burnchain
-                        .leader_key_tx_estimated_size
-                        .unwrap_or(default_burnchain_config.leader_key_tx_estimated_size),
-                    block_commit_tx_estimated_size: burnchain
-                        .block_commit_tx_estimated_size
-                        .unwrap_or(default_burnchain_config.block_commit_tx_estimated_size),
-                    rbf_fee_increment: burnchain
-                        .rbf_fee_increment
-                        .unwrap_or(default_burnchain_config.rbf_fee_increment),
-                    // will be overwritten below
-                    epochs: default_burnchain_config.epochs,
-                    ast_precheck_size_height: burnchain.ast_precheck_size_height,
-                    pox_2_activation: burnchain
-                        .pox_2_activation
-                        .or(default_burnchain_config.pox_2_activation),
-                    sunset_start: burnchain
-                        .sunset_start
-                        .or(default_burnchain_config.sunset_start),
-                    sunset_end: burnchain.sunset_end.or(default_burnchain_config.sunset_end),
-                    wallet_name: burnchain
-                        .wallet_name
-                        .unwrap_or(default_burnchain_config.wallet_name.clone()),
-                };
-
-                if let BitcoinNetworkType::Mainnet = result.get_bitcoin_network().1 {
-                    // check that pox_2_activation hasn't been set in mainnet
-                    if result.pox_2_activation.is_some()
-                        || result.sunset_start.is_some()
-                        || result.sunset_end.is_some()
-                    {
-                        return Err("PoX-2 parameters are not configurable in mainnet".into());
-                    }
-                }
-
-                if let Some(ref conf_epochs) = burnchain.epochs {
-                    result.epochs = Some(Self::make_epochs(
-                        conf_epochs,
-                        &result.mode,
-                        result.get_bitcoin_network().1,
-                        burnchain.pox_2_activation,
-                    )?);
-                }
-
-                result
-            }
+            Some(burnchain) => burnchain.into_config_default(default_burnchain_config)?,
             None => default_burnchain_config,
         };
 
-        let miner_default_config = MinerConfig::default();
-        let miner = match config_file.miner {
-            Some(ref miner) => MinerConfig {
-                min_tx_fee: miner.min_tx_fee.unwrap_or(miner_default_config.min_tx_fee),
-                first_attempt_time_ms: miner
-                    .first_attempt_time_ms
-                    .unwrap_or(miner_default_config.first_attempt_time_ms),
-                subsequent_attempt_time_ms: miner
-                    .subsequent_attempt_time_ms
-                    .unwrap_or(miner_default_config.subsequent_attempt_time_ms),
-                microblock_attempt_time_ms: miner
-                    .microblock_attempt_time_ms
-                    .unwrap_or(miner_default_config.microblock_attempt_time_ms),
-                probability_pick_no_estimate_tx: miner
-                    .probability_pick_no_estimate_tx
-                    .unwrap_or(miner_default_config.probability_pick_no_estimate_tx),
-                block_reward_recipient: miner.block_reward_recipient.as_ref().map(|c| {
-                    PrincipalData::parse(&c)
-                        .expect(&format!("FATAL: not a valid principal identifier: {}", c))
-                }),
-                segwit: miner.segwit.unwrap_or(miner_default_config.segwit),
-                wait_for_block_download: miner_default_config.wait_for_block_download,
-                nonce_cache_size: miner
-                    .nonce_cache_size
-                    .unwrap_or(miner_default_config.nonce_cache_size),
-                candidate_retry_cache_size: miner
-                    .candidate_retry_cache_size
-                    .unwrap_or(miner_default_config.candidate_retry_cache_size),
-                unprocessed_block_deadline_secs: miner
-                    .unprocessed_block_deadline_secs
-                    .unwrap_or(miner_default_config.unprocessed_block_deadline_secs),
-            },
-            None => miner_default_config,
-        };
-
-        let supported_modes = vec![
-            "mocknet", "helium", "neon", "argon", "krypton", "xenon", "mainnet",
+        let supported_modes = [
+            "mocknet",
+            "helium",
+            "neon",
+            "argon",
+            "krypton",
+            "xenon",
+            "mainnet",
+            "nakamoto-neon",
         ];
 
         if !supported_modes.contains(&burnchain.mode.as_str()) {
@@ -928,10 +997,29 @@ impl Config {
             return Err(format!("Config is missing the setting `burnchain.local_mining_public_key` (mandatory for helium)"));
         }
 
+        let is_mainnet = burnchain.mode == "mainnet";
+
+        // Parse the node config
+        let (mut node, bootstrap_node, deny_nodes) = match config_file.node {
+            Some(node) => {
+                let deny_nodes = node.deny_nodes.clone();
+                let bootstrap_node = node.bootstrap_node.clone();
+                let node_config = node.into_config_default(default_node_config)?;
+                (node_config, bootstrap_node, deny_nodes)
+            }
+            None => (default_node_config, None, None),
+        };
+
         if let Some(bootstrap_node) = bootstrap_node {
-            node.set_bootstrap_nodes(bootstrap_node, burnchain.chain_id, burnchain.peer_version);
+            if resolve_bootstrap_nodes {
+                node.set_bootstrap_nodes(
+                    bootstrap_node,
+                    burnchain.chain_id,
+                    burnchain.peer_version,
+                );
+            }
         } else {
-            if burnchain.mode == "mainnet" {
+            if is_mainnet && resolve_bootstrap_nodes {
                 let bootstrap_node = ConfigFile::mainnet().node.unwrap().bootstrap_node.unwrap();
                 node.set_bootstrap_nodes(
                     bootstrap_node,
@@ -944,26 +1032,58 @@ impl Config {
             node.set_deny_nodes(deny_nodes, burnchain.chain_id, burnchain.peer_version);
         }
 
+        // Validate the node config
+        if is_mainnet {
+            if node.use_test_genesis_chainstate == Some(true) {
+                return Err(format!(
+                    "Attempted to run mainnet node with `use_test_genesis_chainstate`"
+                ));
+            }
+        } else if node.require_affirmed_anchor_blocks {
+            // testnet requires that we use the 2.05 rules for anchor block affirmations,
+            // because reward cycle 360 (and possibly future ones) has a different anchor
+            // block choice in 2.05 rules than in 2.1 rules.
+            debug!("Set `require_affirmed_anchor_blocks` to `false` for non-mainnet config");
+            node.require_affirmed_anchor_blocks = false;
+        }
+
+        if node.stacker || node.miner {
+            node.add_miner_stackerdb(is_mainnet);
+            node.add_signers_stackerdbs(is_mainnet);
+        }
+
+        let miner = match config_file.miner {
+            Some(miner) => miner.into_config_default(miner_default_config)?,
+            None => miner_default_config,
+        };
+
         let initial_balances: Vec<InitialBalance> = match config_file.ustx_balance {
-            Some(balances) => balances
-                .iter()
-                .map(|balance| {
-                    let address: PrincipalData =
-                        PrincipalData::parse_standard_principal(&balance.address)
-                            .unwrap()
-                            .into();
-                    InitialBalance {
-                        address,
-                        amount: balance.amount,
-                    }
-                })
-                .collect(),
+            Some(balances) => {
+                if is_mainnet && balances.len() > 0 {
+                    return Err(format!(
+                        "Attempted to run mainnet node with specified `initial_balances`"
+                    ));
+                }
+                balances
+                    .iter()
+                    .map(|balance| {
+                        let address: PrincipalData =
+                            PrincipalData::parse_standard_principal(&balance.address)
+                                .unwrap()
+                                .into();
+                        InitialBalance {
+                            address,
+                            amount: balance.amount,
+                        }
+                    })
+                    .collect()
+            }
             None => vec![],
         };
 
         let mut events_observers = match config_file.events_observer {
             Some(raw_observers) => {
-                let mut observers = vec![];
+                let mut observers = HashSet::new();
                 for observer in raw_observers {
                     let events_keys: Vec<EventKeyType> = observer
                         .events_keys
@@ -973,181 +1093,49 @@ impl Config {
 
                     let endpoint = format!("{}", observer.endpoint);
 
-                    observers.push(EventObserverConfig {
+                    observers.insert(EventObserverConfig {
                         endpoint,
                         events_keys,
                     });
                 }
                 observers
             }
-            None => vec![],
+            None => HashSet::new(),
         };
 
         // check for observer config in env vars
         match std::env::var("STACKS_EVENT_OBSERVER") {
-            Ok(val) => events_observers.push(EventObserverConfig {
-                endpoint: val,
-                events_keys: vec![EventKeyType::AnyEvent],
-            }),
+            Ok(val) => {
+                events_observers.insert(EventObserverConfig {
+                    endpoint: val,
+                    events_keys: vec![EventKeyType::AnyEvent],
+                });
+                ()
+            }
             _ => (),
         };
 
         let connection_options = match config_file.connection_options {
-            Some(opts) => {
-                let ip_addr = match opts.public_ip_address {
-                    Some(public_ip_address) => {
-                        let addr = public_ip_address.parse::<SocketAddr>().unwrap();
-                        debug!("addr.parse {:?}", addr);
-                        Some((PeerAddress::from_socketaddr(&addr), addr.port()))
-                    }
-                    None => None,
-                };
-                let mut read_only_call_limit = HELIUM_DEFAULT_CONNECTION_OPTIONS
-                    .read_only_call_limit
-                    .clone();
-                opts.read_only_call_limit_write_length.map(|x| {
-                    read_only_call_limit.write_length = x;
-                });
-                opts.read_only_call_limit_write_count.map(|x| {
-                    read_only_call_limit.write_count = x;
-                });
-                opts.read_only_call_limit_read_length.map(|x| {
-                    read_only_call_limit.read_length = x;
-                });
-                opts.read_only_call_limit_read_count.map(|x| {
-                    read_only_call_limit.read_count = x;
-                });
-                opts.read_only_call_limit_runtime.map(|x| {
-                    read_only_call_limit.runtime = x;
-                });
-                ConnectionOptions {
-                    read_only_call_limit,
-                    inbox_maxlen: opts
-                        .inbox_maxlen
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inbox_maxlen.clone()),
-                    outbox_maxlen: opts
-                        .outbox_maxlen
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.outbox_maxlen.clone()),
-                    timeout: opts
-                        .timeout
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.timeout.clone()),
-                    idle_timeout: opts
-                        .idle_timeout
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.idle_timeout.clone()),
-                    heartbeat: opts
-                        .heartbeat
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.heartbeat.clone()),
-                    private_key_lifetime: opts.private_key_lifetime.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS
-                            .private_key_lifetime
-                            .clone()
-                    }),
-                    num_neighbors: opts
-                        .num_neighbors
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_neighbors.clone()),
-                    num_clients: opts
-                        .num_clients
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_clients.clone()),
-                    soft_num_neighbors: opts.soft_num_neighbors.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_neighbors.clone()
-                    }),
-                    soft_num_clients: opts.soft_num_clients.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_clients.clone()
-                    }),
-                    max_neighbors_per_host: opts.max_neighbors_per_host.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS
-                            .max_neighbors_per_host
-                            .clone()
-                    }),
-                    max_clients_per_host: opts.max_clients_per_host.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS
-                            .max_clients_per_host
-                            .clone()
-                    }),
-                    soft_max_neighbors_per_host: opts.soft_max_neighbors_per_host.unwrap_or_else(
-                        || {
-                            HELIUM_DEFAULT_CONNECTION_OPTIONS
-                                .soft_max_neighbors_per_host
-                                .clone()
-                        },
-                    ),
-                    soft_max_neighbors_per_org: opts.soft_max_neighbors_per_org.unwrap_or_else(
-                        || {
-                            HELIUM_DEFAULT_CONNECTION_OPTIONS
-                                .soft_max_neighbors_per_org
-                                .clone()
-                        },
-                    ),
-                    soft_max_clients_per_host: opts.soft_max_clients_per_host.unwrap_or_else(
-                        || {
-                            HELIUM_DEFAULT_CONNECTION_OPTIONS
-                                .soft_max_clients_per_host
-                                .clone()
-                        },
-                    ),
-                    walk_interval: opts
-                        .walk_interval
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.walk_interval.clone()),
-                    dns_timeout: opts.dns_timeout.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS.dns_timeout.clone() as u64
-                    }) as u128,
-                    max_inflight_blocks: opts.max_inflight_blocks.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS
-                            .max_inflight_blocks
-                            .clone()
-                    }),
-                    max_inflight_attachments: opts.max_inflight_attachments.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS
-                            .max_inflight_attachments
-                            .clone()
-                    }),
-                    maximum_call_argument_size: opts.maximum_call_argument_size.unwrap_or_else(
-                        || {
-                            HELIUM_DEFAULT_CONNECTION_OPTIONS
-                                .maximum_call_argument_size
-                                .clone()
-                        },
-                    ),
-                    download_interval: opts.download_interval.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS.download_interval.clone()
-                    }),
-                    inv_sync_interval: opts
-                        .inv_sync_interval
-                        .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_sync_interval),
-                    inv_reward_cycles: opts.inv_reward_cycles.unwrap_or_else(|| {
-                        if burnchain.mode == "mainnet" {
-                            HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_reward_cycles
-                        } else {
-                            // testnet reward cycles are a bit smaller (and blocks can go by
-                            // faster), so make our inventory
-                            // reward cycle depth a bit longer to compensate
-                            INV_REWARD_CYCLES_TESTNET
-                        }
-                    }),
-                    public_ip_address: ip_addr,
-                    disable_inbound_walks: opts.disable_inbound_walks.unwrap_or(false),
-                    disable_inbound_handshakes: opts.disable_inbound_handshakes.unwrap_or(false),
-                    disable_block_download: opts.disable_block_download.unwrap_or(false),
-                    force_disconnect_interval: opts.force_disconnect_interval,
-                    max_http_clients: opts.max_http_clients.unwrap_or_else(|| {
-                        HELIUM_DEFAULT_CONNECTION_OPTIONS.max_http_clients.clone()
-                    }),
-                    connect_timeout: opts.connect_timeout.unwrap_or(10),
-                    handshake_timeout: opts.connect_timeout.unwrap_or(5),
-                    max_sockets: opts.max_sockets.unwrap_or(800) as usize,
-                    antientropy_public: opts.antientropy_public.unwrap_or(true),
-                    ..ConnectionOptions::default()
-                }
-            }
+            Some(opts) => opts.into_config(is_mainnet)?,
             None => HELIUM_DEFAULT_CONNECTION_OPTIONS.clone(),
         };
 
         let estimation = match config_file.fee_estimation {
             Some(f) => FeeEstimationConfig::from(f),
-            None => FeeEstimationConfig::default(),
+            None => default_estimator,
         };
 
+        let atlas = match config_file.atlas {
+            Some(f) => f.into_config(is_mainnet),
+            None => AtlasConfig::new(is_mainnet),
+        };
+
+        atlas
+            .validate()
+            .map_err(|e| format!("Atlas config error: {e}"))?;
+
         Ok(Config {
+            config_path: config_file.__path,
             node,
             burnchain,
             initial_balances,
@@ -1155,6 +1143,7 @@ impl Config {
             connection_options,
             estimation,
             miner,
+            atlas,
         })
     }
 
@@ -1176,10 +1165,12 @@ impl Config {
     pub fn get_estimates_path(&self) -> PathBuf {
         let mut path = self.get_chainstate_path();
         path.push("estimates");
-        fs::create_dir_all(&path).expect(&format!(
-            "Failed to create `estimates` directory at {}",
-            path.to_string_lossy()
-        ));
+        fs::create_dir_all(&path).unwrap_or_else(|_| {
+            panic!(
+                "Failed to create `estimates` directory at {}",
+                path.to_string_lossy()
+            )
+        });
         path
     }
 
@@ -1228,6 +1219,12 @@ impl Config {
         path.to_str().expect("Unable to produce path").to_string()
     }
 
+    pub fn get_stacker_db_file_path(&self) -> String {
+        let mut path = self.get_chainstate_path();
+        path.set_file_name("stacker_db.sqlite");
+        path.to_str().expect("Unable to produce path").to_string()
+    }
+
     pub fn add_initial_balance(&mut self, address: String, amount: u64) {
         let new_balance = InitialBalance {
             address: PrincipalData::parse_standard_principal(&address)
@@ -1257,64 +1254,109 @@ impl Config {
         self.events_observers.len() > 0
     }
 
+    pub fn make_nakamoto_block_builder_settings(
+        &self,
+        miner_status: Arc<Mutex<MinerStatus>>,
+    ) -> BlockBuilderSettings {
+        let miner_config = self.get_miner_config();
+        BlockBuilderSettings {
+            max_miner_time_ms: miner_config.nakamoto_attempt_time_ms,
+            mempool_settings: MemPoolWalkSettings {
+                max_walk_time_ms: miner_config.nakamoto_attempt_time_ms,
+                consider_no_estimate_tx_prob: miner_config.probability_pick_no_estimate_tx,
+                nonce_cache_size: miner_config.nonce_cache_size,
+                candidate_retry_cache_size: miner_config.candidate_retry_cache_size,
+                txs_to_consider: miner_config.txs_to_consider,
+                filter_origins: miner_config.filter_origins,
+            },
+            miner_status,
+            confirm_microblocks: false,
+        }
+    }
+
     pub fn make_block_builder_settings(
         &self,
         attempt: u64,
         microblocks: bool,
         miner_status: Arc<Mutex<MinerStatus>>,
     ) -> BlockBuilderSettings {
+        let miner_config = self.get_miner_config();
         BlockBuilderSettings {
             max_miner_time_ms: if microblocks {
-                self.miner.microblock_attempt_time_ms
+                miner_config.microblock_attempt_time_ms
             } else if attempt <= 1 {
                 // first attempt to mine a block -- do so right away
-                self.miner.first_attempt_time_ms
+                miner_config.first_attempt_time_ms
             } else {
                 // second or later attempt to mine a block -- give it some time
-                self.miner.subsequent_attempt_time_ms
+                miner_config.subsequent_attempt_time_ms
             },
             mempool_settings: MemPoolWalkSettings {
-                min_tx_fee: self.miner.min_tx_fee,
                 max_walk_time_ms: if microblocks {
-                    self.miner.microblock_attempt_time_ms
+                    miner_config.microblock_attempt_time_ms
                 } else if attempt <= 1 {
                     // first attempt to mine a block -- do so right away
-                    self.miner.first_attempt_time_ms
+                    miner_config.first_attempt_time_ms
                 } else {
                     // second or later attempt to mine a block -- give it some time
-                    self.miner.subsequent_attempt_time_ms
+                    miner_config.subsequent_attempt_time_ms
                 },
-                consider_no_estimate_tx_prob: self.miner.probability_pick_no_estimate_tx,
-                nonce_cache_size: self.miner.nonce_cache_size,
-                candidate_retry_cache_size: self.miner.candidate_retry_cache_size,
+                consider_no_estimate_tx_prob: miner_config.probability_pick_no_estimate_tx,
+                nonce_cache_size: miner_config.nonce_cache_size,
+                candidate_retry_cache_size: miner_config.candidate_retry_cache_size,
+                txs_to_consider: miner_config.txs_to_consider,
+                filter_origins: miner_config.filter_origins,
             },
             miner_status,
+            confirm_microblocks: true,
         }
+    }
+
+    pub fn get_miner_stats(&self) -> Option<MinerStats> {
+        let miner_config = self.get_miner_config();
+        if let Some(unconfirmed_commits_helper) = miner_config.unconfirmed_commits_helper.as_ref() {
+            let miner_stats = MinerStats {
+                unconfirmed_commits_helper: unconfirmed_commits_helper.clone(),
+            };
+            return Some(miner_stats);
+        }
+        None
+    }
+
+    /// Determine how long the p2p state machine should poll for.
+    /// If the node is not mining, then use a default value.
+    /// If the node is mining, however, then at the time of this writing, the miner's latency is in
+    /// part dependent on the state machine getting block data back to the miner quickly, and thus
+    /// the poll time is dependent on the first attempt time.
+    pub fn get_poll_time(&self) -> u64 {
+        let poll_timeout = if self.node.miner {
+            cmp::min(5000, self.miner.first_attempt_time_ms / 2)
+        } else {
+            5000
+        };
+        poll_timeout
     }
 }
 
 impl std::default::Default for Config {
     fn default() -> Config {
-        // Testnet's name
-        let node = NodeConfig {
-            ..NodeConfig::default()
-        };
-
-        let burnchain = BurnchainConfig {
-            ..BurnchainConfig::default()
-        };
+        let node = NodeConfig::default();
+        let burnchain = BurnchainConfig::default();
 
         let connection_options = HELIUM_DEFAULT_CONNECTION_OPTIONS.clone();
         let estimation = FeeEstimationConfig::default();
+        let mainnet = burnchain.mode == "mainnet";
 
         Config {
+            config_path: None,
             burnchain,
             node,
             initial_balances: vec![],
-            events_observers: vec![],
+            events_observers: HashSet::new(),
             connection_options,
             estimation,
             miner: MinerConfig::default(),
+            atlas: AtlasConfig::new(mainnet),
         }
     }
 }
@@ -1343,14 +1385,20 @@ pub struct BurnchainConfig {
     pub leader_key_tx_estimated_size: u64,
     pub block_commit_tx_estimated_size: u64,
     pub rbf_fee_increment: u64,
+    pub first_burn_block_height: Option<u64>,
+    pub first_burn_block_timestamp: Option<u32>,
+    pub first_burn_block_hash: Option<String>,
     /// Custom override for the definitions of the epochs. This will only be applied for testnet and
     /// regtest nodes.
     pub epochs: Option<Vec<StacksEpoch>>,
     pub pox_2_activation: Option<u32>,
+    pub pox_reward_length: Option<u32>,
+    pub pox_prepare_length: Option<u32>,
     pub sunset_start: Option<u32>,
     pub sunset_end: Option<u32>,
     pub wallet_name: String,
     pub ast_precheck_size_height: Option<u64>,
+    pub affirmation_overrides: HashMap<u64, AffirmationMap>,
 }
 
 impl BurnchainConfig {
@@ -1378,15 +1426,20 @@ impl BurnchainConfig {
             leader_key_tx_estimated_size: LEADER_KEY_TX_ESTIM_SIZE,
             block_commit_tx_estimated_size: BLOCK_COMMIT_TX_ESTIM_SIZE,
             rbf_fee_increment: DEFAULT_RBF_FEE_RATE_INCREMENT,
+            first_burn_block_height: None,
+            first_burn_block_timestamp: None,
+            first_burn_block_hash: None,
             epochs: None,
             pox_2_activation: None,
+            pox_prepare_length: None,
+            pox_reward_length: None,
             sunset_start: None,
             sunset_end: None,
             wallet_name: "".to_string(),
             ast_precheck_size_height: None,
+            affirmation_overrides: HashMap::new(),
         }
     }
-
     pub fn get_rpc_url(&self, wallet: Option<String>) -> String {
         let scheme = match self.rpc_ssl {
             true => "https://",
@@ -1415,10 +1468,10 @@ impl BurnchainConfig {
         match self.mode.as_str() {
             "mainnet" => ("mainnet".to_string(), BitcoinNetworkType::Mainnet),
             "xenon" => ("testnet".to_string(), BitcoinNetworkType::Testnet),
-            "helium" | "neon" | "argon" | "krypton" | "mocknet" => {
+            "helium" | "neon" | "argon" | "krypton" | "mocknet" | "nakamoto-neon" => {
                 ("regtest".to_string(), BitcoinNetworkType::Regtest)
             }
-            _ => panic!("Invalid bitcoin mode -- expected mainnet, testnet, or regtest"),
+            other => panic!("Invalid stacks-node mode: {other}"),
         }
     }
 }
@@ -1436,6 +1489,14 @@ pub const EPOCH_CONFIG_2_1_0: &'static str = "2.1";
 pub const EPOCH_CONFIG_2_2_0: &'static str = "2.2";
 pub const EPOCH_CONFIG_2_3_0: &'static str = "2.3";
 pub const EPOCH_CONFIG_2_4_0: &'static str = "2.4";
+pub const EPOCH_CONFIG_2_5_0: &'static str = "2.5";
+pub const EPOCH_CONFIG_3_0_0: &'static str = "3.0";
+
+#[derive(Clone, Deserialize, Default, Debug)]
+pub struct AffirmationOverride {
+    pub reward_cycle: u64,
+    pub affirmation: String,
+}
 
 #[derive(Clone, Deserialize, Default, Debug)]
 pub struct BurnchainConfigFile {
@@ -1459,15 +1520,262 @@ pub struct BurnchainConfigFile {
     pub block_commit_tx_estimated_size: Option<u64>,
     pub rbf_fee_increment: Option<u64>,
     pub max_rbf: Option<u64>,
+    pub first_burn_block_height: Option<u64>,
+    pub first_burn_block_timestamp: Option<u32>,
+    pub first_burn_block_hash: Option<String>,
     pub epochs: Option<Vec<StacksEpochConfigFile>>,
+    pub pox_prepare_length: Option<u32>,
+    pub pox_reward_length: Option<u32>,
     pub pox_2_activation: Option<u32>,
     pub sunset_start: Option<u32>,
     pub sunset_end: Option<u32>,
     pub wallet_name: Option<String>,
     pub ast_precheck_size_height: Option<u64>,
+    pub affirmation_overrides: Option<Vec<AffirmationOverride>>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl BurnchainConfigFile {
+    /// Add affirmation overrides required to sync Xenon Testnet node.
+    ///
+    /// The Xenon Testnet Stacks 2.4 activation height occurred before the finalized SIP-024 updates and release of the stacks-node versioned 2.4.0.0.0.
+    /// This caused the Stacks Xenon testnet to undergo a deep reorg when 2.4.0.0.0 was finalized. This deep reorg meant that 3 reward cycles were
+    /// invalidated, which requires overrides in the affirmation map to continue correct operation. Those overrides are required for cycles 413, 414, and 415.
+    pub fn add_affirmation_overrides_xenon(&mut self) {
+        let mut default_overrides = vec![
+        AffirmationOverride {
+            reward_cycle: 413,
+            affirmation: "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpa".to_string()
+        },
+        AffirmationOverride {
+            reward_cycle: 414,
+            affirmation: "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpaa".to_string()
+        },
+        AffirmationOverride {
+            reward_cycle: 415,
+            affirmation: "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpaaa".to_string()
+        }];
+
+        // Now compute the 2.5 overrides.
+        let affirmations_pre_2_5 = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnpppppnnnnnnnnnnnnnnnnnnnnnnnpppppppppppppppnnnnnnnnnnnnnnnnnnnnnnnppppppppppnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnppppppppnnnnnnnnnnnnnnnnnnnnnnnppnppnnnnnnnnnnnnnnnnnnnnnnnppppnnnnnnnnnnnnnnnnnnnnnnnnnppppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnnnpppppppnnnnnnnnnnnnnnnnnnnnnnnnnnpnnnnnnnnnnnnnnnnnnnnnnnnnpppnppppppppppppppnnppppnpaaaapppppppnnnnnnnnnnnnnnnnnnnnnnnpnppnppppnnnnnnnnnnnnnnnnnnnnnnnnnppnnnnnnnnnnnnnnnnnnnnnnnpnpppppppppnppnnnnnnnnnnnnnnnnnnnnnnnnnppnppppppppp";
+        let xenon_pox_consts = PoxConstants::testnet_default();
+        let last_present_cycle = xenon_pox_consts
+            .block_height_to_reward_cycle(
+                BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
+                BITCOIN_TESTNET_STACKS_25_BURN_HEIGHT,
+            )
+            .unwrap();
+        assert_eq!(
+            u64::try_from(affirmations_pre_2_5.len()).unwrap(),
+            last_present_cycle - 1
+        );
+        let last_override = xenon_pox_consts
+            .block_height_to_reward_cycle(
+                BITCOIN_TESTNET_FIRST_BLOCK_HEIGHT,
+                BITCOIN_TESTNET_STACKS_25_REORGED_HEIGHT,
+            )
+            .unwrap();
+        let override_values = ["a", "n"];
+
+        for (override_index, reward_cycle) in (last_present_cycle + 1..=last_override).enumerate() {
+            assert!(override_values.len() > override_index);
+            let overrides = override_values[..(override_index + 1)].join("");
+            let affirmation = format!("{affirmations_pre_2_5}{overrides}");
+            default_overrides.push(AffirmationOverride {
+                reward_cycle,
+                affirmation,
+            });
+        }
+
+        if let Some(affirmation_overrides) = self.affirmation_overrides.as_mut() {
+            for affirmation in default_overrides {
+                // insert at front, so that the hashmap uses the configured overrides
+                //  instead of the defaults (the configured overrides will write over the
+                //  the defaults because they come later in the list).
+                affirmation_overrides.insert(0, affirmation);
+            }
+        } else {
+            self.affirmation_overrides = Some(default_overrides);
+        };
+    }
+
+    fn into_config_default(
+        mut self,
+        default_burnchain_config: BurnchainConfig,
+    ) -> Result<BurnchainConfig, String> {
+        if self.mode.as_deref() == Some("xenon") {
+            if self.magic_bytes.is_none() {
+                self.magic_bytes = ConfigFile::xenon().burnchain.unwrap().magic_bytes;
+            }
+            self.add_affirmation_overrides_xenon();
+        }
+
+        let mode = self.mode.unwrap_or(default_burnchain_config.mode);
+        let is_mainnet = mode == "mainnet";
+        if is_mainnet {
+            // check magic bytes and set if not defined
+            let mainnet_magic = ConfigFile::mainnet().burnchain.unwrap().magic_bytes;
+            if self.magic_bytes.is_none() {
+                self.magic_bytes = mainnet_magic.clone();
+            }
+            if self.magic_bytes != mainnet_magic {
+                return Err(format!(
+                    "Attempted to run mainnet node with bad magic bytes '{}'",
+                    self.magic_bytes.as_ref().unwrap()
+                ));
+            }
+        }
+
+        let mut affirmation_overrides = HashMap::new();
+        if let Some(aos) = self.affirmation_overrides {
+            for ao in aos {
+                let Some(affirmation_map) = AffirmationMap::decode(&ao.affirmation) else {
+                    return Err(format!(
+                        "Invalid affirmation override for reward cycle {}: {}",
+                        ao.reward_cycle, ao.affirmation
+                    ));
+                };
+                if u64::try_from(affirmation_map.len()).unwrap() != ao.reward_cycle - 1 {
+                    return Err(format!(
+                        "Invalid affirmation override for reward cycle {}. Map len = {}, but expected {}.",
+                        ao.reward_cycle, affirmation_map.len(), ao.reward_cycle - 1,
+                    ));
+                }
+                affirmation_overrides.insert(ao.reward_cycle, affirmation_map);
+            }
+        }
+
+        let mut config = BurnchainConfig {
+            chain: self.chain.unwrap_or(default_burnchain_config.chain),
+            chain_id: if is_mainnet {
+                CHAIN_ID_MAINNET
+            } else {
+                CHAIN_ID_TESTNET
+            },
+            peer_version: if is_mainnet {
+                PEER_VERSION_MAINNET
+            } else {
+                PEER_VERSION_TESTNET
+            },
+            mode,
+            burn_fee_cap: self
+                .burn_fee_cap
+                .unwrap_or(default_burnchain_config.burn_fee_cap),
+            commit_anchor_block_within: self
+                .commit_anchor_block_within
+                .unwrap_or(default_burnchain_config.commit_anchor_block_within),
+            peer_host: match self.peer_host.as_ref() {
+                Some(peer_host) => {
+                    // Using std::net::LookupHost would be preferable, but it's
+                    // unfortunately unstable at this point.
+                    // https://doc.rust-lang.org/1.6.0/std/net/struct.LookupHost.html
+                    let mut sock_addrs = format!("{}:1", &peer_host)
+                        .to_socket_addrs()
+                        .map_err(|e| format!("Invalid burnchain.peer_host: {}", &e))?;
+                    let sock_addr = match sock_addrs.next() {
+                        Some(addr) => addr,
+                        None => {
+                            return Err(format!(
+                                "No IP address could be queried for '{}'",
+                                &peer_host
+                            ));
+                        }
+                    };
+                    format!("{}", sock_addr.ip())
+                }
+                None => default_burnchain_config.peer_host,
+            },
+            peer_port: self.peer_port.unwrap_or(default_burnchain_config.peer_port),
+            rpc_port: self.rpc_port.unwrap_or(default_burnchain_config.rpc_port),
+            rpc_ssl: self.rpc_ssl.unwrap_or(default_burnchain_config.rpc_ssl),
+            username: self.username,
+            password: self.password,
+            timeout: self.timeout.unwrap_or(default_burnchain_config.timeout),
+            magic_bytes: self
+                .magic_bytes
+                .map(|magic_ascii| {
+                    assert_eq!(magic_ascii.len(), 2, "Magic bytes must be length-2");
+                    assert!(magic_ascii.is_ascii(), "Magic bytes must be ASCII");
+                    MagicBytes::from(magic_ascii.as_bytes())
+                })
+                .unwrap_or(default_burnchain_config.magic_bytes),
+            local_mining_public_key: self.local_mining_public_key,
+            process_exit_at_block_height: self.process_exit_at_block_height,
+            poll_time_secs: self
+                .poll_time_secs
+                .unwrap_or(default_burnchain_config.poll_time_secs),
+            satoshis_per_byte: self
+                .satoshis_per_byte
+                .unwrap_or(default_burnchain_config.satoshis_per_byte),
+            max_rbf: self.max_rbf.unwrap_or(default_burnchain_config.max_rbf),
+            leader_key_tx_estimated_size: self
+                .leader_key_tx_estimated_size
+                .unwrap_or(default_burnchain_config.leader_key_tx_estimated_size),
+            block_commit_tx_estimated_size: self
+                .block_commit_tx_estimated_size
+                .unwrap_or(default_burnchain_config.block_commit_tx_estimated_size),
+            rbf_fee_increment: self
+                .rbf_fee_increment
+                .unwrap_or(default_burnchain_config.rbf_fee_increment),
+            first_burn_block_height: self
+                .first_burn_block_height
+                .or(default_burnchain_config.first_burn_block_height),
+            first_burn_block_timestamp: self
+                .first_burn_block_timestamp
+                .or(default_burnchain_config.first_burn_block_timestamp),
+            first_burn_block_hash: self
+                .first_burn_block_hash
+                .clone()
+                .or(default_burnchain_config.first_burn_block_hash.clone()),
+            // will be overwritten below
+            epochs: default_burnchain_config.epochs,
+            ast_precheck_size_height: self.ast_precheck_size_height,
+            pox_2_activation: self
+                .pox_2_activation
+                .or(default_burnchain_config.pox_2_activation),
+            sunset_start: self.sunset_start.or(default_burnchain_config.sunset_start),
+            sunset_end: self.sunset_end.or(default_burnchain_config.sunset_end),
+            wallet_name: self
+                .wallet_name
+                .unwrap_or(default_burnchain_config.wallet_name.clone()),
+            pox_reward_length: self
+                .pox_reward_length
+                .or(default_burnchain_config.pox_reward_length),
+            pox_prepare_length: self
+                .pox_prepare_length
+                .or(default_burnchain_config.pox_prepare_length),
+            affirmation_overrides,
+        };
+
+        if let BitcoinNetworkType::Mainnet = config.get_bitcoin_network().1 {
+            // check that pox_2_activation hasn't been set in mainnet
+            if config.pox_2_activation.is_some()
+                || config.sunset_start.is_some()
+                || config.sunset_end.is_some()
+            {
+                return Err("PoX-2 parameters are not configurable in mainnet".into());
+            }
+            // Check that the first burn block options are not set in mainnet
+            if config.first_burn_block_height.is_some()
+                || config.first_burn_block_timestamp.is_some()
+                || config.first_burn_block_hash.is_some()
+            {
+                return Err("First burn block parameters are not configurable in mainnet".into());
+            }
+        }
+
+        if let Some(ref conf_epochs) = self.epochs {
+            config.epochs = Some(Config::make_epochs(
+                conf_epochs,
+                &config.mode,
+                config.get_bitcoin_network().1,
+                self.pox_2_activation,
+            )?);
+        }
+
+        Ok(config)
+    }
+}
+#[derive(Clone, Debug)]
 pub struct NodeConfig {
     pub name: String,
     pub seed: Vec<u8>,
@@ -1480,12 +1788,20 @@ pub struct NodeConfig {
     pub bootstrap_node: Vec<Neighbor>,
     pub deny_nodes: Vec<Neighbor>,
     pub miner: bool,
+    pub stacker: bool,
     pub mock_mining: bool,
     pub mine_microblocks: bool,
     pub microblock_frequency: u64,
     pub max_microblocks: u64,
     pub wait_time_for_microblocks: u64,
     pub wait_time_for_blocks: u64,
+    /// Controls how frequently, in milliseconds, the nakamoto miner's relay thread acts on its own initiative
+    /// (as opposed to responding to an event from the networking thread, etc.). This is roughly
+    /// how frequently the miner checks if a new burnchain block has been processed.
+    ///
+    /// Default value of 10 seconds is reasonable in mainnet (where bitcoin blocks are ~10 minutes),
+    /// but environments where burn blocks are more frequent may want to decrease this value.
+    pub next_initiative_delay: u64,
     pub prometheus_bind: Option<String>,
     pub marf_cache_strategy: Option<String>,
     pub marf_defer_hashing: bool,
@@ -1499,6 +1815,8 @@ pub struct NodeConfig {
     /// At most, how often should the chain-liveness thread
     ///  wake up the chains-coordinator. Defaults to 300s (5 min).
     pub chain_liveness_poll_time_secs: u64,
+    /// stacker DBs we replicate
+    pub stacker_dbs: Vec<QualifiedContractIdentifier>,
 }
 
 #[derive(Clone, Debug)]
@@ -1731,8 +2049,8 @@ impl FeeEstimationConfig {
     }
 }
 
-impl NodeConfig {
-    fn default() -> NodeConfig {
+impl Default for NodeConfig {
+    fn default() -> Self {
         let mut rng = rand::thread_rng();
         let mut buf = [0u8; 8];
         rng.fill_bytes(&mut buf);
@@ -1762,12 +2080,14 @@ impl NodeConfig {
             deny_nodes: vec![],
             local_peer_seed: local_peer_seed.to_vec(),
             miner: false,
+            stacker: false,
             mock_mining: false,
             mine_microblocks: true,
             microblock_frequency: 30_000,
             max_microblocks: u16::MAX as u64,
             wait_time_for_microblocks: 30_000,
             wait_time_for_blocks: 30_000,
+            next_initiative_delay: 10_000,
             prometheus_bind: None,
             marf_cache_strategy: None,
             marf_defer_hashing: true,
@@ -1777,6 +2097,42 @@ impl NodeConfig {
             require_affirmed_anchor_blocks: true,
             fault_injection_hide_blocks: false,
             chain_liveness_poll_time_secs: 300,
+            stacker_dbs: vec![],
+        }
+    }
+}
+
+impl NodeConfig {
+    /// Get a SocketAddr for this node's RPC endpoint which uses the loopback address
+    pub fn get_rpc_loopback(&self) -> Option<SocketAddr> {
+        let rpc_port = SocketAddr::from_str(&self.rpc_bind)
+            .or_else(|e| {
+                error!("Could not parse node.rpc_bind configuration setting as SocketAddr: {e}");
+                Err(())
+            })
+            .ok()?
+            .port();
+        Some(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), rpc_port))
+    }
+
+    pub fn add_signers_stackerdbs(&mut self, is_mainnet: bool) {
+        for signer_set in 0..2 {
+            for message_id in 0..SIGNER_SLOTS_PER_USER {
+                let contract_name = NakamotoSigners::make_signers_db_name(signer_set, message_id);
+                let contract_id = boot_code_id(contract_name.as_str(), is_mainnet);
+                if !self.stacker_dbs.contains(&contract_id) {
+                    debug!("A miner/stacker must subscribe to the {contract_id} stacker db contract. Forcibly subscribing...");
+                    self.stacker_dbs.push(contract_id);
+                }
+            }
+        }
+    }
+
+    pub fn add_miner_stackerdb(&mut self, is_mainnet: bool) {
+        let miners_contract_id = boot_code_id(MINERS_NAME, is_mainnet);
+        if !self.stacker_dbs.contains(&miners_contract_id) {
+            debug!("A miner/stacker must subscribe to the {miners_contract_id} stacker db contract. Forcibly subscribing...");
+            self.stacker_dbs.push(miners_contract_id);
         }
     }
 
@@ -1806,7 +2162,7 @@ impl NodeConfig {
     }
 
     pub fn add_bootstrap_node(&mut self, bootstrap_node: &str, chain_id: u32, peer_version: u32) {
-        let parts: Vec<&str> = bootstrap_node.split("@").collect();
+        let parts: Vec<&str> = bootstrap_node.split('@').collect();
         if parts.len() != 2 {
             panic!(
                 "Invalid bootstrap node '{}': expected PUBKEY@IP:PORT",
@@ -1815,9 +2171,44 @@ impl NodeConfig {
         }
         let (pubkey_str, hostport) = (parts[0], parts[1]);
         let pubkey = Secp256k1PublicKey::from_hex(pubkey_str)
-            .expect(&format!("Invalid public key '{}'", pubkey_str));
+            .unwrap_or_else(|_| panic!("Invalid public key '{pubkey_str}'"));
         debug!("Resolve '{}'", &hostport);
-        let sockaddr = hostport.to_socket_addrs().unwrap().next().unwrap();
+
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut delay = Duration::from_secs(2);
+
+        let sockaddr = loop {
+            match hostport.to_socket_addrs() {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        break addr;
+                    } else {
+                        panic!("No addresses found for '{}'", hostport);
+                    }
+                }
+                Err(e) => {
+                    if attempts >= max_attempts {
+                        panic!(
+                            "Failed to resolve '{}' after {} attempts: {}",
+                            hostport, max_attempts, e
+                        );
+                    } else {
+                        error!(
+                            "Attempt {} - Failed to resolve '{}': {}. Retrying in {:?}...",
+                            attempts + 1,
+                            hostport,
+                            e,
+                            delay
+                        );
+                        thread::sleep(delay);
+                        attempts += 1;
+                        delay *= 2;
+                    }
+                }
+            }
+        };
+
         let neighbor = NodeConfig::default_neighbor(sockaddr, pubkey, chain_id, peer_version);
         self.bootstrap_node.push(neighbor);
     }
@@ -1828,8 +2219,7 @@ impl NodeConfig {
         chain_id: u32,
         peer_version: u32,
     ) {
-        let parts: Vec<&str> = bootstrap_nodes.split(",").collect();
-        for part in parts.into_iter() {
+        for part in bootstrap_nodes.split(',') {
             if part.len() > 0 {
                 self.add_bootstrap_node(&part, chain_id, peer_version);
             }
@@ -1848,8 +2238,7 @@ impl NodeConfig {
     }
 
     pub fn set_deny_nodes(&mut self, deny_nodes: String, chain_id: u32, peer_version: u32) {
-        let parts: Vec<&str> = deny_nodes.split(",").collect();
-        for part in parts.into_iter() {
+        for part in deny_nodes.split(',') {
             if part.len() > 0 {
                 self.add_deny_node(&part, chain_id, peer_version);
             }
@@ -1874,12 +2263,13 @@ impl NodeConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MinerConfig {
-    pub min_tx_fee: u64,
     pub first_attempt_time_ms: u64,
     pub subsequent_attempt_time_ms: u64,
     pub microblock_attempt_time_ms: u64,
+    /// Max time to assemble Nakamoto block
+    pub nakamoto_attempt_time_ms: u64,
     pub probability_pick_no_estimate_tx: u8,
     pub block_reward_recipient: Option<PrincipalData>,
     /// If possible, mine with a p2wpkh address
@@ -1890,22 +2280,68 @@ pub struct MinerConfig {
     pub nonce_cache_size: u64,
     pub candidate_retry_cache_size: u64,
     pub unprocessed_block_deadline_secs: u64,
+    pub mining_key: Option<Secp256k1PrivateKey>,
+    /// Amount of time while mining in nakamoto to wait in between mining interim blocks
+    pub wait_on_interim_blocks: Duration,
+    /// minimum number of transactions that must be in a block if we're going to replace a pending
+    /// block-commit with a new block-commit
+    pub min_tx_count: u64,
+    /// Only allow a block's tx count to increase across RBFs.
+    pub only_increase_tx_count: bool,
+    /// Path to a script that prints out all unconfirmed block-commits for a list of addresses
+    pub unconfirmed_commits_helper: Option<String>,
+    /// Targeted win probability for this miner.  Used to deduce when to stop trying to mine.
+    pub target_win_probability: f64,
+    /// Path to a serialized RegisteredKey struct, which points to an already-registered VRF key
+    /// (so we don't have to go make a new one)
+    pub activated_vrf_key_path: Option<String>,
+    /// When estimating win probability, whether or not to use the assumed win rate 6+ blocks from
+    /// now (true), or the current win rate (false)
+    pub fast_rampup: bool,
+    /// Number of Bitcoin blocks which must pass where the boostes+neutrals are a minority, at which
+    /// point the miner will stop trying.
+    pub underperform_stop_threshold: Option<u64>,
+    /// Kinds of transactions to consider from the mempool.  This is used by boosted and neutral
+    /// miners to push past averse fee estimations.
+    pub txs_to_consider: HashSet<MemPoolWalkTxTypes>,
+    /// Origin addresses to whitelist when doing a mempool walk.  This is used by boosted and
+    /// neutral miners to push transactions through that are important to them.
+    pub filter_origins: HashSet<StacksAddress>,
+    /// When selecting the "nicest" tip, do not consider tips that are more than this many blocks
+    /// behind the highest tip.
+    pub max_reorg_depth: u64,
+    /// Amount of time while mining in nakamoto to wait for signers to respond to a proposed block
+    pub wait_on_signers: Duration,
 }
 
-impl MinerConfig {
-    pub fn default() -> MinerConfig {
+impl Default for MinerConfig {
+    fn default() -> MinerConfig {
         MinerConfig {
-            min_tx_fee: 1,
-            first_attempt_time_ms: 5_000,
-            subsequent_attempt_time_ms: 30_000,
+            first_attempt_time_ms: 10,
+            subsequent_attempt_time_ms: 120_000,
             microblock_attempt_time_ms: 30_000,
-            probability_pick_no_estimate_tx: 5,
+            nakamoto_attempt_time_ms: 10_000,
+            probability_pick_no_estimate_tx: 25,
             block_reward_recipient: None,
             segwit: false,
             wait_for_block_download: true,
-            nonce_cache_size: 10_000,
-            candidate_retry_cache_size: 10_000,
+            nonce_cache_size: 1024 * 1024,
+            candidate_retry_cache_size: 1024 * 1024,
             unprocessed_block_deadline_secs: 30,
+            mining_key: None,
+            wait_on_interim_blocks: Duration::from_millis(2_500),
+            min_tx_count: 0,
+            only_increase_tx_count: false,
+            unconfirmed_commits_helper: None,
+            target_win_probability: 0.0,
+            activated_vrf_key_path: None,
+            fast_rampup: false,
+            underperform_stop_threshold: None,
+            txs_to_consider: MemPoolWalkTxTypes::all(),
+            filter_origins: HashSet::new(),
+            max_reorg_depth: 3,
+            // TODO: update to a sane value based on stackerdb benchmarking
+            wait_on_signers: Duration::from_secs(200),
         }
     }
 }
@@ -1937,7 +2373,6 @@ pub struct ConnectionOptionsFile {
     pub max_inflight_attachments: Option<u64>,
     pub read_only_call_limit_write_length: Option<u64>,
     pub read_only_call_limit_read_length: Option<u64>,
-
     pub read_only_call_limit_write_count: Option<u64>,
     pub read_only_call_limit_read_count: Option<u64>,
     pub read_only_call_limit_runtime: Option<u64>,
@@ -1952,6 +2387,138 @@ pub struct ConnectionOptionsFile {
     pub disable_block_download: Option<bool>,
     pub force_disconnect_interval: Option<u64>,
     pub antientropy_public: Option<bool>,
+    pub private_neighbors: Option<bool>,
+    pub block_proposal_token: Option<String>,
+    pub antientropy_retry: Option<u64>,
+}
+
+impl ConnectionOptionsFile {
+    fn into_config(self, is_mainnet: bool) -> Result<ConnectionOptions, String> {
+        let ip_addr = self
+            .public_ip_address
+            .map(|public_ip_address| {
+                public_ip_address
+                    .parse::<SocketAddr>()
+                    .map(|addr| (PeerAddress::from_socketaddr(&addr), addr.port()))
+                    .map_err(|e| format!("Invalid connection_option.public_ip_address: {}", e))
+            })
+            .transpose()?;
+        let mut read_only_call_limit = HELIUM_DEFAULT_CONNECTION_OPTIONS
+            .read_only_call_limit
+            .clone();
+        self.read_only_call_limit_write_length.map(|x| {
+            read_only_call_limit.write_length = x;
+        });
+        self.read_only_call_limit_write_count.map(|x| {
+            read_only_call_limit.write_count = x;
+        });
+        self.read_only_call_limit_read_length.map(|x| {
+            read_only_call_limit.read_length = x;
+        });
+        self.read_only_call_limit_read_count.map(|x| {
+            read_only_call_limit.read_count = x;
+        });
+        self.read_only_call_limit_runtime.map(|x| {
+            read_only_call_limit.runtime = x;
+        });
+        let default = ConnectionOptions::default();
+        Ok(ConnectionOptions {
+            read_only_call_limit,
+            inbox_maxlen: self
+                .inbox_maxlen
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inbox_maxlen),
+            outbox_maxlen: self
+                .outbox_maxlen
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.outbox_maxlen),
+            timeout: self
+                .timeout
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.timeout),
+            idle_timeout: self
+                .idle_timeout
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.idle_timeout),
+            heartbeat: self
+                .heartbeat
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.heartbeat),
+            private_key_lifetime: self
+                .private_key_lifetime
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.private_key_lifetime),
+            num_neighbors: self
+                .num_neighbors
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_neighbors),
+            num_clients: self
+                .num_clients
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.num_clients),
+            soft_num_neighbors: self
+                .soft_num_neighbors
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_neighbors),
+            soft_num_clients: self
+                .soft_num_clients
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_num_clients),
+            max_neighbors_per_host: self
+                .max_neighbors_per_host
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_neighbors_per_host),
+            max_clients_per_host: self
+                .max_clients_per_host
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_clients_per_host),
+            soft_max_neighbors_per_host: self
+                .soft_max_neighbors_per_host
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_host),
+            soft_max_neighbors_per_org: self
+                .soft_max_neighbors_per_org
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_neighbors_per_org),
+            soft_max_clients_per_host: self
+                .soft_max_clients_per_host
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.soft_max_clients_per_host),
+            walk_interval: self
+                .walk_interval
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.walk_interval.clone()),
+            dns_timeout: self
+                .dns_timeout
+                .map(|dns_timeout| dns_timeout as u128)
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.dns_timeout),
+            max_inflight_blocks: self
+                .max_inflight_blocks
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_inflight_blocks),
+            max_inflight_attachments: self
+                .max_inflight_attachments
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_inflight_attachments),
+            maximum_call_argument_size: self
+                .maximum_call_argument_size
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.maximum_call_argument_size),
+            download_interval: self
+                .download_interval
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.download_interval.clone()),
+            inv_sync_interval: self
+                .inv_sync_interval
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_sync_interval),
+            inv_reward_cycles: self.inv_reward_cycles.unwrap_or_else(|| {
+                if is_mainnet {
+                    HELIUM_DEFAULT_CONNECTION_OPTIONS.inv_reward_cycles
+                } else {
+                    // testnet reward cycles are a bit smaller (and blocks can go by
+                    // faster), so make our inventory
+                    // reward cycle depth a bit longer to compensate
+                    INV_REWARD_CYCLES_TESTNET
+                }
+            }),
+            public_ip_address: ip_addr,
+            disable_inbound_walks: self.disable_inbound_walks.unwrap_or(false),
+            disable_inbound_handshakes: self.disable_inbound_handshakes.unwrap_or(false),
+            disable_block_download: self.disable_block_download.unwrap_or(false),
+            force_disconnect_interval: self.force_disconnect_interval,
+            max_http_clients: self
+                .max_http_clients
+                .unwrap_or_else(|| HELIUM_DEFAULT_CONNECTION_OPTIONS.max_http_clients.clone()),
+            connect_timeout: self.connect_timeout.unwrap_or(10),
+            handshake_timeout: self.handshake_timeout.unwrap_or(5),
+            max_sockets: self.max_sockets.unwrap_or(800) as usize,
+            antientropy_public: self.antientropy_public.unwrap_or(true),
+            private_neighbors: self.private_neighbors.unwrap_or(true),
+            block_proposal_token: self.block_proposal_token,
+            antientropy_retry: self.antientropy_retry.unwrap_or(default.antientropy_retry),
+            ..default
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, Default, Debug)]
@@ -1967,12 +2534,14 @@ pub struct NodeConfigFile {
     pub bootstrap_node: Option<String>,
     pub local_peer_seed: Option<String>,
     pub miner: Option<bool>,
+    pub stacker: Option<bool>,
     pub mock_mining: Option<bool>,
     pub mine_microblocks: Option<bool>,
     pub microblock_frequency: Option<u64>,
     pub max_microblocks: Option<u64>,
     pub wait_time_for_microblocks: Option<u64>,
     pub wait_time_for_blocks: Option<u64>,
+    pub next_initiative_delay: Option<u64>,
     pub prometheus_bind: Option<String>,
     pub marf_cache_strategy: Option<String>,
     pub marf_defer_hashing: Option<bool>,
@@ -1983,9 +2552,92 @@ pub struct NodeConfigFile {
     /// At most, how often should the chain-liveness thread
     ///  wake up the chains-coordinator. Defaults to 300s (5 min).
     pub chain_liveness_poll_time_secs: Option<u64>,
+    /// Stacker DBs we replicate
+    pub stacker_dbs: Option<Vec<String>>,
 }
 
-#[derive(Clone, Deserialize, Debug)]
+impl NodeConfigFile {
+    fn into_config_default(self, default_node_config: NodeConfig) -> Result<NodeConfig, String> {
+        let rpc_bind = self.rpc_bind.unwrap_or(default_node_config.rpc_bind);
+        let miner = self.miner.unwrap_or(default_node_config.miner);
+        let stacker = self.stacker.unwrap_or(default_node_config.stacker);
+        let node_config = NodeConfig {
+            name: self.name.unwrap_or(default_node_config.name),
+            seed: match self.seed {
+                Some(seed) => hex_bytes(&seed)
+                    .map_err(|_e| format!("node.seed should be a hex encoded string"))?,
+                None => default_node_config.seed,
+            },
+            working_dir: std::env::var("STACKS_WORKING_DIR")
+                .unwrap_or(self.working_dir.unwrap_or(default_node_config.working_dir)),
+            rpc_bind: rpc_bind.clone(),
+            p2p_bind: self.p2p_bind.unwrap_or(default_node_config.p2p_bind),
+            p2p_address: self.p2p_address.unwrap_or(rpc_bind.clone()),
+            bootstrap_node: vec![],
+            deny_nodes: vec![],
+            data_url: match self.data_url {
+                Some(data_url) => data_url,
+                None => format!("http://{}", rpc_bind),
+            },
+            local_peer_seed: match self.local_peer_seed {
+                Some(seed) => hex_bytes(&seed)
+                    .map_err(|_e| format!("node.local_peer_seed should be a hex encoded string"))?,
+                None => default_node_config.local_peer_seed,
+            },
+            miner,
+            stacker,
+            mock_mining: self.mock_mining.unwrap_or(default_node_config.mock_mining),
+            mine_microblocks: self
+                .mine_microblocks
+                .unwrap_or(default_node_config.mine_microblocks),
+            microblock_frequency: self
+                .microblock_frequency
+                .unwrap_or(default_node_config.microblock_frequency),
+            max_microblocks: self
+                .max_microblocks
+                .unwrap_or(default_node_config.max_microblocks),
+            wait_time_for_microblocks: self
+                .wait_time_for_microblocks
+                .unwrap_or(default_node_config.wait_time_for_microblocks),
+            wait_time_for_blocks: self
+                .wait_time_for_blocks
+                .unwrap_or(default_node_config.wait_time_for_blocks),
+            next_initiative_delay: self
+                .next_initiative_delay
+                .unwrap_or(default_node_config.next_initiative_delay),
+            prometheus_bind: self.prometheus_bind,
+            marf_cache_strategy: self.marf_cache_strategy,
+            marf_defer_hashing: self
+                .marf_defer_hashing
+                .unwrap_or(default_node_config.marf_defer_hashing),
+            pox_sync_sample_secs: self
+                .pox_sync_sample_secs
+                .unwrap_or(default_node_config.pox_sync_sample_secs),
+            use_test_genesis_chainstate: self.use_test_genesis_chainstate,
+            always_use_affirmation_maps: self
+                .always_use_affirmation_maps
+                .unwrap_or(default_node_config.always_use_affirmation_maps),
+            // miners should always try to mine, even if they don't have the anchored
+            // blocks in the canonical affirmation map. Followers, however, can stall.
+            require_affirmed_anchor_blocks: self.require_affirmed_anchor_blocks.unwrap_or(!miner),
+            // chainstate fault_injection activation for hide_blocks.
+            // you can't set this in the config file.
+            fault_injection_hide_blocks: false,
+            chain_liveness_poll_time_secs: self
+                .chain_liveness_poll_time_secs
+                .unwrap_or(default_node_config.chain_liveness_poll_time_secs),
+            stacker_dbs: self
+                .stacker_dbs
+                .unwrap_or(vec![])
+                .iter()
+                .filter_map(|contract_id| QualifiedContractIdentifier::parse(contract_id).ok())
+                .collect(),
+        };
+        Ok(node_config)
+    }
+}
+
+#[derive(Clone, Deserialize, Default, Debug)]
 pub struct FeeEstimationConfigFile {
     pub cost_estimator: Option<String>,
     pub fee_estimator: Option<String>,
@@ -1996,47 +2648,177 @@ pub struct FeeEstimationConfigFile {
     pub fee_rate_window_size: Option<u64>,
 }
 
-impl Default for FeeEstimationConfigFile {
-    fn default() -> Self {
-        Self {
-            cost_estimator: None,
-            fee_estimator: None,
-            cost_metric: None,
-            disabled: None,
-            log_error: None,
-            fee_rate_fuzzer_fraction: None,
-            fee_rate_window_size: None,
-        }
-    }
-}
-
 #[derive(Clone, Deserialize, Default, Debug)]
 pub struct MinerConfigFile {
-    pub min_tx_fee: Option<u64>,
     pub first_attempt_time_ms: Option<u64>,
     pub subsequent_attempt_time_ms: Option<u64>,
     pub microblock_attempt_time_ms: Option<u64>,
+    pub nakamoto_attempt_time_ms: Option<u64>,
     pub probability_pick_no_estimate_tx: Option<u8>,
     pub block_reward_recipient: Option<String>,
     pub segwit: Option<bool>,
     pub nonce_cache_size: Option<u64>,
     pub candidate_retry_cache_size: Option<u64>,
     pub unprocessed_block_deadline_secs: Option<u64>,
+    pub mining_key: Option<String>,
+    pub wait_on_interim_blocks_ms: Option<u64>,
+    pub min_tx_count: Option<u64>,
+    pub only_increase_tx_count: Option<bool>,
+    pub unconfirmed_commits_helper: Option<String>,
+    pub target_win_probability: Option<f64>,
+    pub activated_vrf_key_path: Option<String>,
+    pub fast_rampup: Option<bool>,
+    pub underperform_stop_threshold: Option<u64>,
+    pub txs_to_consider: Option<String>,
+    pub filter_origins: Option<String>,
+    pub max_reorg_depth: Option<u64>,
+    pub wait_on_signers_ms: Option<u64>,
 }
 
+impl MinerConfigFile {
+    fn into_config_default(self, miner_default_config: MinerConfig) -> Result<MinerConfig, String> {
+        Ok(MinerConfig {
+            first_attempt_time_ms: self
+                .first_attempt_time_ms
+                .unwrap_or(miner_default_config.first_attempt_time_ms),
+            subsequent_attempt_time_ms: self
+                .subsequent_attempt_time_ms
+                .unwrap_or(miner_default_config.subsequent_attempt_time_ms),
+            microblock_attempt_time_ms: self
+                .microblock_attempt_time_ms
+                .unwrap_or(miner_default_config.microblock_attempt_time_ms),
+            nakamoto_attempt_time_ms: self
+                .nakamoto_attempt_time_ms
+                .unwrap_or(miner_default_config.nakamoto_attempt_time_ms),
+            probability_pick_no_estimate_tx: self
+                .probability_pick_no_estimate_tx
+                .unwrap_or(miner_default_config.probability_pick_no_estimate_tx),
+            block_reward_recipient: self
+                .block_reward_recipient
+                .map(|c| {
+                    PrincipalData::parse(&c).map_err(|e| {
+                        format!(
+                            "miner.block_reward_recipient is not a valid principal identifier: {e}"
+                        )
+                    })
+                })
+                .transpose()?,
+            segwit: self.segwit.unwrap_or(miner_default_config.segwit),
+            wait_for_block_download: miner_default_config.wait_for_block_download,
+            nonce_cache_size: self
+                .nonce_cache_size
+                .unwrap_or(miner_default_config.nonce_cache_size),
+            candidate_retry_cache_size: self
+                .candidate_retry_cache_size
+                .unwrap_or(miner_default_config.candidate_retry_cache_size),
+            unprocessed_block_deadline_secs: self
+                .unprocessed_block_deadline_secs
+                .unwrap_or(miner_default_config.unprocessed_block_deadline_secs),
+            mining_key: self
+                .mining_key
+                .as_ref()
+                .map(|x| Secp256k1PrivateKey::from_hex(x))
+                .transpose()?,
+            wait_on_interim_blocks: self
+                .wait_on_interim_blocks_ms
+                .map(Duration::from_millis)
+                .unwrap_or(miner_default_config.wait_on_interim_blocks),
+            min_tx_count: self
+                .min_tx_count
+                .unwrap_or(miner_default_config.min_tx_count),
+            only_increase_tx_count: self
+                .only_increase_tx_count
+                .unwrap_or(miner_default_config.only_increase_tx_count),
+            unconfirmed_commits_helper: self.unconfirmed_commits_helper.clone(),
+            target_win_probability: self
+                .target_win_probability
+                .unwrap_or(miner_default_config.target_win_probability),
+            activated_vrf_key_path: self.activated_vrf_key_path.clone(),
+            fast_rampup: self.fast_rampup.unwrap_or(miner_default_config.fast_rampup),
+            underperform_stop_threshold: self.underperform_stop_threshold,
+            txs_to_consider: {
+                if let Some(txs_to_consider) = &self.txs_to_consider {
+                    txs_to_consider
+                        .split(',')
+                        .map(
+                            |txs_to_consider_str| match str::parse(txs_to_consider_str) {
+                                Ok(txtype) => txtype,
+                                Err(e) => {
+                                    panic!("could not parse '{}': {}", &txs_to_consider_str, &e);
+                                }
+                            },
+                        )
+                        .collect()
+                } else {
+                    MemPoolWalkTxTypes::all()
+                }
+            },
+            filter_origins: {
+                if let Some(filter_origins) = &self.filter_origins {
+                    filter_origins
+                        .split(',')
+                        .map(|origin_str| match StacksAddress::from_string(origin_str) {
+                            Some(addr) => addr,
+                            None => {
+                                panic!("could not parse '{}' into a Stacks address", origin_str);
+                            }
+                        })
+                        .collect()
+                } else {
+                    HashSet::new()
+                }
+            },
+            max_reorg_depth: self
+                .max_reorg_depth
+                .unwrap_or(miner_default_config.max_reorg_depth),
+            wait_on_signers: self
+                .wait_on_signers_ms
+                .map(Duration::from_millis)
+                .unwrap_or(miner_default_config.wait_on_signers),
+        })
+    }
+}
 #[derive(Clone, Deserialize, Default, Debug)]
+pub struct AtlasConfigFile {
+    pub attachments_max_size: Option<u32>,
+    pub max_uninstantiated_attachments: Option<u32>,
+    pub uninstantiated_attachments_expire_after: Option<u32>,
+    pub unresolved_attachment_instances_expire_after: Option<u32>,
+}
+
+impl AtlasConfigFile {
+    // Can't inplement `Into` trait because this takes a parameter
+    fn into_config(&self, mainnet: bool) -> AtlasConfig {
+        let mut conf = AtlasConfig::new(mainnet);
+        if let Some(val) = self.attachments_max_size {
+            conf.attachments_max_size = val
+        }
+        if let Some(val) = self.max_uninstantiated_attachments {
+            conf.max_uninstantiated_attachments = val
+        }
+        if let Some(val) = self.uninstantiated_attachments_expire_after {
+            conf.uninstantiated_attachments_expire_after = val
+        }
+        if let Some(val) = self.unresolved_attachment_instances_expire_after {
+            conf.unresolved_attachment_instances_expire_after = val
+        }
+        conf
+    }
+}
+
+#[derive(Clone, Deserialize, Default, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub struct EventObserverConfigFile {
     pub endpoint: String,
     pub events_keys: Vec<String>,
 }
 
-#[derive(Clone, Default, Debug)]
+#[derive(Clone, Default, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub struct EventObserverConfig {
     pub endpoint: String,
     pub events_keys: Vec<EventKeyType>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd)]
 pub enum EventKeyType {
     SmartContractEvent((QualifiedContractIdentifier, String)),
     AssetEvent(AssetIdentifier),
@@ -2047,6 +2829,8 @@ pub enum EventKeyType {
     BurnchainBlocks,
     MinedBlocks,
     MinedMicroblocks,
+    StackerDBChunks,
+    BlockProposal,
 }
 
 impl EventKeyType {
@@ -2071,9 +2855,17 @@ impl EventKeyType {
             return Some(EventKeyType::Microblocks);
         }
 
+        if raw_key == "stackerdb" {
+            return Some(EventKeyType::StackerDBChunks);
+        }
+
+        if raw_key == "block_proposal" {
+            return Some(EventKeyType::BlockProposal);
+        }
+
         let comps: Vec<_> = raw_key.split("::").collect();
         if comps.len() == 1 {
-            let split: Vec<_> = comps[0].split(".").collect();
+            let split: Vec<_> = comps[0].split('.').collect();
             if split.len() != 3 {
                 return None;
             }
