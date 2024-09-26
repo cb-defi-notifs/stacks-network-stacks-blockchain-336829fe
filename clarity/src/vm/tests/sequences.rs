@@ -14,36 +14,18 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::vm::types::signatures::{ListTypeData, SequenceSubtype};
-use crate::vm::types::TypeSignature::{BoolType, IntType, SequenceType, UIntType};
-use crate::vm::types::{StringSubtype, StringUTF8Length, TypeSignature, Value};
-#[cfg(test)]
 use rstest::rstest;
-#[cfg(test)]
 use rstest_reuse::{self, *};
-
-use crate::vm::analysis::errors::CheckError;
-use crate::vm::errors::{CheckErrors, Error, RuntimeErrorType};
-use crate::vm::types::signatures::SequenceSubtype::{BufferType, ListType, StringType};
-use crate::vm::types::signatures::StringSubtype::ASCII;
-use crate::vm::types::BufferLength;
-use crate::vm::types::CharType::UTF8;
-use crate::vm::{execute, execute_v2, ClarityVersion};
 use stacks_common::types::StacksEpochId;
-use std::convert::{TryFrom, TryInto};
 
-#[template]
-#[rstest]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch2_05)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch24)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch24)]
-fn test_clarity_versions_sequences(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {}
+use crate::vm::errors::{CheckErrors, Error, RuntimeErrorType};
+use crate::vm::tests::test_clarity_versions;
+use crate::vm::types::signatures::SequenceSubtype;
+use crate::vm::types::signatures::SequenceSubtype::{BufferType, StringType};
+use crate::vm::types::signatures::StringSubtype::ASCII;
+use crate::vm::types::TypeSignature::{BoolType, IntType, SequenceType, UIntType};
+use crate::vm::types::{BufferLength, StringSubtype, StringUTF8Length, TypeSignature, Value};
+use crate::vm::{execute, execute_v2, ClarityVersion};
 
 #[test]
 fn test_simple_list_admission() {
@@ -109,7 +91,7 @@ fn test_index_of() {
     for (good_test, expected) in good.iter().zip(expected.iter()) {
         assert_eq!(
             expected,
-            &format!("{}", execute(&good_test).unwrap().unwrap())
+            &format!("{}", execute(good_test).unwrap().unwrap())
         );
     }
 
@@ -123,21 +105,21 @@ fn test_index_of() {
     let bad_expected = [
         CheckErrors::ExpectedSequence(TypeSignature::IntType),
         CheckErrors::TypeValueError(
-            TypeSignature::min_buffer(),
+            TypeSignature::min_buffer().unwrap(),
             execute("\"a\"").unwrap().unwrap(),
         ),
         CheckErrors::TypeValueError(
-            TypeSignature::min_string_utf8(),
+            TypeSignature::min_string_utf8().unwrap(),
             execute("\"a\"").unwrap().unwrap(),
         ),
         CheckErrors::TypeValueError(
-            TypeSignature::min_string_ascii(),
+            TypeSignature::min_string_ascii().unwrap(),
             execute("u\"a\"").unwrap().unwrap(),
         ),
     ];
 
     for (bad_test, expected) in bad.iter().zip(bad_expected.iter()) {
-        match execute(&bad_test).unwrap_err() {
+        match execute(bad_test).unwrap_err() {
             Error::Unchecked(check_error) => {
                 assert_eq!(&check_error, expected);
             }
@@ -175,7 +157,7 @@ fn test_element_at() {
     for (good_test, expected) in good.iter().zip(expected.iter()) {
         assert_eq!(
             expected,
-            &format!("{}", execute(&good_test).unwrap().unwrap())
+            &format!("{}", execute(good_test).unwrap().unwrap())
         );
     }
 
@@ -187,7 +169,7 @@ fn test_element_at() {
     ];
 
     for (bad_test, expected) in bad.iter().zip(bad_expected.iter()) {
-        match execute(&bad_test).unwrap_err() {
+        match execute(bad_test).unwrap_err() {
             Error::Unchecked(check_error) => {
                 assert_eq!(&check_error, expected);
             }
@@ -814,7 +796,7 @@ fn test_simple_buff_replace_at() {
     assert_eq!(
         execute_v2("(replace-at? 0x445522 u0 0x0044)").unwrap_err(),
         CheckErrors::TypeValueError(
-            SequenceType(BufferType(buff_len.clone())),
+            SequenceType(BufferType(buff_len)),
             Value::buff_from(vec![0, 68]).unwrap()
         )
         .into()
@@ -891,7 +873,7 @@ fn test_simple_string_ascii_replace_at() {
     assert_eq!(
         execute_v2("(replace-at? \"abc\" u0 \"de\")").unwrap_err(),
         CheckErrors::TypeValueError(
-            SequenceType(StringType(ASCII(buff_len.clone()))),
+            SequenceType(StringType(ASCII(buff_len))),
             Value::string_ascii_from_bytes("de".into()).unwrap()
         )
         .into()
@@ -972,7 +954,7 @@ fn test_simple_string_utf8_replace_at() {
     assert_eq!(
         execute_v2("(replace-at? u\"abc\" u0 u\"de\")").unwrap_err(),
         CheckErrors::TypeValueError(
-            TypeSignature::SequenceType(StringType(StringSubtype::UTF8(str_len.clone()))),
+            TypeSignature::SequenceType(StringType(StringSubtype::UTF8(str_len))),
             Value::string_utf8_from_string_utf8_literal("de".to_string()).unwrap()
         )
         .into()
@@ -1110,15 +1092,15 @@ fn test_list_tuple_admission() {
                (tuple (value 0x3031))
                (tuple (value 0x3032)))";
 
-    let result_type = TypeSignature::type_of(&execute(test).unwrap().unwrap());
-    let expected_type = TypeSignature::type_of(&execute(expected_type).unwrap().unwrap());
+    let result_type = TypeSignature::type_of(&execute(test).unwrap().unwrap()).unwrap();
+    let expected_type = TypeSignature::type_of(&execute(expected_type).unwrap().unwrap()).unwrap();
     let testing_value = &execute(not_expected_type).unwrap().unwrap();
-    let not_expected_type = TypeSignature::type_of(testing_value);
+    let not_expected_type = TypeSignature::type_of(testing_value).unwrap();
 
     assert_eq!(expected_type, result_type);
     assert!(not_expected_type != result_type);
     assert!(result_type
-        .admits(&StacksEpochId::Epoch21, &testing_value)
+        .admits(&StacksEpochId::Epoch21, testing_value)
         .unwrap());
 }
 
@@ -1172,7 +1154,7 @@ fn test_buff_len() {
     assert_eq!(expected, execute(test2).unwrap().unwrap());
 }
 
-#[apply(test_clarity_versions_sequences)]
+#[apply(test_clarity_versions)]
 fn test_construct_bad_list(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let test1 = "(list 1 2 3 true)";
     assert_eq!(

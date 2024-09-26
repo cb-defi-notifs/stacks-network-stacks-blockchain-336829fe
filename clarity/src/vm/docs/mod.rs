@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use super::types::signatures::{FunctionArgSignature, FunctionReturnsSignature};
 use crate::vm::analysis::type_checker::v2_1::natives::SimpleNativeFunction;
 use crate::vm::analysis::type_checker::v2_1::TypedNativeFunction;
 use crate::vm::costs::ExecutionCost;
@@ -23,8 +24,6 @@ use crate::vm::types::signatures::ASCII_40;
 use crate::vm::types::{FixedFunction, FunctionType, SequenceSubtype, StringSubtype, Value};
 use crate::vm::variables::NativeVariables;
 use crate::vm::ClarityVersion;
-
-use super::types::signatures::{FunctionArgSignature, FunctionReturnsSignature};
 
 pub mod contracts;
 
@@ -42,7 +41,9 @@ pub struct KeywordAPI {
     pub description: &'static str,
     pub example: &'static str,
     /// The version where this keyword was first introduced.
-    pub version: ClarityVersion,
+    pub min_version: ClarityVersion,
+    /// The version where this keyword was disabled.
+    pub max_version: Option<ClarityVersion>,
 }
 
 #[derive(Serialize, Clone)]
@@ -64,7 +65,9 @@ pub struct FunctionAPI {
     pub description: String,
     pub example: String,
     /// The version where this keyword was first introduced.
-    pub version: ClarityVersion,
+    pub min_version: ClarityVersion,
+    /// The version where this keyword was disabled.
+    pub max_version: Option<ClarityVersion>,
 }
 
 pub struct SimpleFunctionAPI {
@@ -97,17 +100,19 @@ const BLOCK_HEIGHT: SimpleKeywordAPI = SimpleKeywordAPI {
     name: "block-height",
     snippet: "block-height",
     output_type: "uint",
-    description: "Returns the current block height of the Stacks blockchain as an uint",
+    description: "Returns the current block height of the Stacks blockchain in Clarity 1 and 2.
+Upon activation of epoch 3.0, `block-height` will return the same value as `tenure-height`.
+In Clarity 3, `block-height` is removed and has been replaced with `stacks-block-height`.",
     example:
-        "(> block-height 1000) ;; returns true if the current block-height has passed 1000 blocks.",
+        "(> block-height u1000) ;; returns true if the current block-height has passed 1000 blocks.",
 };
 
 const BURN_BLOCK_HEIGHT: SimpleKeywordAPI = SimpleKeywordAPI {
     name: "burn-block-height",
     snippet: "burn-block-height",
     output_type: "uint",
-    description: "Returns the current block height of the underlying burn blockchain as a uint",
-    example: "(> burn-block-height 1000) ;; returns true if the current height of the underlying burn blockchain has passed 1000 blocks.",
+    description: "Returns the current block height of the underlying burn blockchain.",
+    example: "(> burn-block-height u832000) ;; returns true if the current height of the underlying burn blockchain has passed 832,000 blocks.",
 };
 
 const CONTRACT_CALLER_KEYWORD: SimpleKeywordAPI = SimpleKeywordAPI {
@@ -119,6 +124,25 @@ the caller will be equal to the signing principal. If `contract-call?` was used 
 changes to the _calling_ contract's principal. If `as-contract` is used to change the `tx-sender` context, `contract-caller` _also_ changes
 to the same contract principal.",
     example: "(print contract-caller) ;; Will print out a Stacks address of the transaction sender",
+};
+
+const STACKS_BLOCK_HEIGHT_KEYWORD: SimpleKeywordAPI = SimpleKeywordAPI {
+    name: "stacks-block-height",
+    snippet: "stacks-block-height",
+    output_type: "uint",
+    description: "Returns the current block height of the Stacks blockchain.",
+    example:
+        "(<= stacks-block-height u500000) ;; returns true if the current block-height has not passed 500,000 blocks.",
+};
+
+const TENURE_HEIGHT_KEYWORD: SimpleKeywordAPI = SimpleKeywordAPI {
+    name: "tenure-height",
+    snippet: "tenure-height",
+    output_type: "uint",
+    description: "Returns the number of tenures that have passed.
+At the start of epoch 3.0, `tenure-height` will return the same value as `block-height`, then it will continue to increase as each tenures passes.",
+    example:
+        "(< tenure-height u140000) ;; returns true if the current tenure-height has passed 140,000 blocks.",
 };
 
 const TX_SENDER_KEYWORD: SimpleKeywordAPI = SimpleKeywordAPI {
@@ -246,7 +270,7 @@ const BUFF_TO_UINT_LE_API: SimpleFunctionAPI = SimpleFunctionAPI {
     name: None,
     snippet: "buff-to-uint-le ${1:buff}",
     signature: "(buff-to-uint-le (buff 16))",
-    description: "Converts a byte buffer to an unsigned integer use a little-endian encoding..
+    description: "Converts a byte buffer to an unsigned integer use a little-endian encoding.
 The byte buffer can be up to 16 bytes in length. If there are fewer than 16 bytes, as
 this function uses a little-endian encoding, the input behaves as if it is
 zero-padded on the _right_.
@@ -570,7 +594,7 @@ const BITWISE_NOT_API: SimpleFunctionAPI = SimpleFunctionAPI {
     snippet: "bit-not ${1:expr-1}",
     signature: "(bit-not i1)",
     description: "Returns the one's compliement (sometimes also called the bitwise compliment or not operator) of `i1`, effectively reversing the bits in `i1`.
-In other words, every bit that is `1` in ì1` will be `0` in the result.  Conversely, every bit that is `0` in `i1` will be `1` in the result.
+In other words, every bit that is `1` in `ì1` will be `0` in the result.  Conversely, every bit that is `0` in `i1` will be `1` in the result.
 ",
     example: "(bit-not 3) ;; Returns -4
 (bit-not u128) ;; Returns u340282366920938463463374607431768211327
@@ -777,6 +801,7 @@ pub fn get_input_type_string(function_type: &FunctionType) -> String {
     }
 }
 
+#[allow(clippy::panic)]
 pub fn get_output_type_string(function_type: &FunctionType) -> String {
     match function_type {
         FunctionType::Variadic(_, ref out_type) => format!("{}", out_type),
@@ -826,6 +851,8 @@ pub fn get_signature(function_name: &str, function_type: &FunctionType) -> Optio
     }
 }
 
+#[allow(clippy::expect_used)]
+#[allow(clippy::panic)]
 fn make_for_simple_native(
     api: &SimpleFunctionAPI,
     function: &NativeFunctions,
@@ -834,6 +861,7 @@ fn make_for_simple_native(
     let (input_type, output_type) = {
         if let TypedNativeFunction::Simple(SimpleNativeFunction(function_type)) =
             TypedNativeFunction::type_native_function(&function)
+                .expect("Failed to type a native function")
         {
             let input_type = get_input_type_string(&function_type);
             let output_type = get_output_type_string(&function_type);
@@ -854,7 +882,8 @@ fn make_for_simple_native(
         signature: api.signature.to_string(),
         description: api.description.to_string(),
         example: api.example.to_string(),
-        version: function.get_version(),
+        min_version: function.get_min_version(),
+        max_version: function.get_max_version(),
     }
 }
 
@@ -896,7 +925,8 @@ const LET_API: SpecialAPI = SpecialAPI {
 evaluating each expression and _binding_ it to the corresponding variable name.
 `let` bindings are sequential: when a `let` binding is evaluated, it may refer to prior binding.
 The _context_ created by this set of bindings is used for evaluating its body expressions.
- The let expression returns the value of the last such body expression.
+The let expression returns the value of the last such body expression.
+
 Note: intermediary statements returning a response type must be checked",
     example: "(let ((a 2) (b (+ 5 6 7))) (print a) (print b) (+ a b)) ;; Returns 20
 (let ((a 5) (c (+ a 1)) (d (+ c 1)) (b (+ a c d))) (print a) (print b) (+ a b)) ;; Returns 23",
@@ -937,7 +967,8 @@ and outputs a _list_ of the same type containing the outputs from those function
 Applicable sequence types are `(list A)`, `buff`, `string-ascii` and `string-utf8`,
 for which the corresponding element types are, respectively, `A`, `(buff 1)`, `(string-ascii 1)` and `(string-utf8 1)`.
 The `func` argument must be a literal function name.
-Also, note that, no matter what kind of sequences the inputs are, the output is always a list.",
+
+Note: no matter what kind of sequences the inputs are, the output is always a list.",
     example: r#"
 (map not (list true false true false)) ;; Returns (false true false true)
 (map + (list 1 2 3) (list 1 2 3) (list 1 2 3)) ;; Returns (3 6 9)
@@ -1069,6 +1100,7 @@ const ELEMENT_AT_API: SpecialAPI = SpecialAPI {
     description: "The `element-at?` function returns the element at `index` in the provided sequence.
 Applicable sequence types are `(list A)`, `buff`, `string-ascii` and `string-utf8`,
 for which the corresponding element types are, respectively, `A`, `(buff 1)`, `(string-ascii 1)` and `(string-utf8 1)`.
+
 In Clarity1, `element-at` must be used (without the `?`). The `?` is added in Clarity2 for consistency -- built-ins that return responses or optionals end in `?`. The Clarity1 spelling is left as an alias in Clarity2 for backwards compatibility.
 ",
     example: r#"
@@ -1091,6 +1123,7 @@ Applicable sequence types are `(list A)`, `buff`, `string-ascii` and `string-utf
 for which the corresponding element types are, respectively, `A`, `(buff 1)`, `(string-ascii 1)` and `(string-utf8 1)`.
 If the target item is not found in the sequence (or if an empty string or buffer is
 supplied), this function returns `none`.
+
 In Clarity1, `index-of` must be used (without the `?`). The `?` is added in Clarity2 for consistency -- built-ins that return responses or optionals end in `?`. The Clarity1 spelling is left as an alias in Clarity2 for backwards compatibility.
 ",
     example: r#"
@@ -1139,6 +1172,7 @@ const BEGIN_API: SpecialAPI = SpecialAPI {
     signature: "(begin expr1 expr2 expr3 ... expr-last)",
     description: "The `begin` function evaluates each of its input expressions, returning the
 return value of the last such expression.
+
 Note: intermediary statements returning a response type must be checked.",
     example: "(begin (+ 1 2) 4 5) ;; Returns 5",
 };
@@ -1243,7 +1277,7 @@ const TUPLE_GET_API: SpecialAPI = SpecialAPI {
     signature: "(get key-name tuple)",
     description: "The `get` function fetches the value associated with a given key from the supplied typed tuple.
 If an `Optional` value is supplied as the inputted tuple, `get` returns an `Optional` type of the specified key in
-the tuple. If the supplied option is a `(none)` option, get returns `(none)`.",
+the tuple. If the supplied option is a `none` option, get returns `none`.",
     example: "(define-map names-map { name: (string-ascii 12) } { id: int })
 (map-insert names-map { name: \"blockstack\" } { id: 1337 }) ;; Returns true
 (get id (tuple (name \"blockstack\") (id 1337))) ;; Returns 1337
@@ -1315,7 +1349,8 @@ const KECCAK256_API: SpecialAPI = SpecialAPI {
     output_type: "(buff 32)",
     signature: "(keccak256 value)",
     description: "The `keccak256` function computes `KECCAK256(value)` of the inputted value.
-Note that this differs from the `NIST SHA-3` (that is, FIPS 202) standard. If an integer (128 bit)
+
+Note: this differs from the `NIST SHA-3` (that is, FIPS 202) standard. If an integer (128 bit)
 is supplied the hash is computed over the little-endian representation of the integer.",
     example: "(keccak256 0) ;; Returns 0xf490de2920c8a35fabeb13208852aa28c76f9be9b03a4dd2b3c075f7a26923b4"
 };
@@ -1325,11 +1360,13 @@ const SECP256K1RECOVER_API: SpecialAPI = SpecialAPI {
     snippet: "secp256k1-recover? ${1:message-hash} ${2:signature}",
     output_type: "(response (buff 33) uint)",
     signature: "(secp256k1-recover? message-hash signature)",
-    description: "The `secp256k1-recover?` function recovers the public key used to sign the message  which sha256 is `message-hash`
-    with the provided `signature`.
-    If the signature does not match, it will return the error code `(err u1).`.
-    If the signature is invalid, it will return the error code `(err u2).`.
-    The signature includes 64 bytes plus an additional recovery id (00..03) for a total of 65 bytes.",
+    description: "The `secp256k1-recover?` function recovers the public key used to sign the message whose sha256 is `message-hash`
+with the provided `signature`. The signature includes 64 bytes plus an additional recovery id (00..03) for a total of 65 bytes.
+On success, it returns the public key as a 33-byte buffer. This function may fail with one of the following error codes:
+
+* `(err u1)` - the signature does not match the message hash
+* `(err u2)` - the signature is invalid
+",
     example: "(secp256k1-recover? 0xde5b9eb9e7c5592930eb2e30a01369c36586d872082ed8181ee83d2a0ec20f04
  0x8738487ebe69b93d8e51583be8eee50bb4213fc49c767d329632730cc193b873554428fc936ca3569afc15f1c9365f6591d6251a89fee9c9ac661116824d3a1301)
  ;; Returns (ok 0x03adb8de4bfb65db2cfd6120d55c6526ae9c52e675db7e47308636534ba7786110)"
@@ -1389,7 +1426,9 @@ const PRINCIPAL_OF_API: SpecialAPI = SpecialAPI {
     output_type: "(response principal uint)",
     signature: "(principal-of? public-key)",
     description: "The `principal-of?` function returns the principal derived from the provided public key.
-    If the `public-key` is invalid, it will return the error code `(err u1).`.
+This function may fail with the error code:
+
+* `(err u1)` -- `public-key` is invalid
 
 Note: Before Stacks 2.1, this function has a bug, in that the principal returned would always
 be a testnet single-signature principal, even if the function were run on the mainnet. Starting
@@ -1417,7 +1456,7 @@ The function returns the result of evaluating `expr`.
     example: "
 (define-data-var data int 1)
 (at-block 0x0000000000000000000000000000000000000000000000000000000000000000 block-height) ;; Returns u0
-(at-block (get-block-info? id-header-hash 0) (var-get data)) ;; Throws NoSuchDataVariable because `data` wasn't initialized at block height 0"
+(at-block (unwrap-panic (get-block-info? id-header-hash u0)) (var-get data)) ;; Throws NoSuchDataVariable because `data` wasn't initialized at block height 0"
 };
 
 const AS_CONTRACT_API: SpecialAPI = SpecialAPI {
@@ -1450,7 +1489,7 @@ const EXPECTS_API: SpecialAPI = SpecialAPI {
     description: "The `unwrap!` function attempts to 'unpack' the first argument: if the argument is
 an option type, and the argument is a `(some ...)` option, `unwrap!` returns the inner value of the
 option. If the argument is a response type, and the argument is an `(ok ...)` response, `unwrap!` returns
- the inner value of the `ok`. If the supplied argument is either an `(err ...)` or a `(none)` value,
+ the inner value of the `ok`. If the supplied argument is either an `(err ...)` or a `none` value,
 `unwrap!` _returns_ `thrown-value` from the current function and exits the current control-flow.",
     example: "
 (define-map names-map { name: (string-ascii 12) } { id: int })
@@ -1496,7 +1535,7 @@ const UNWRAP_API: SpecialAPI = SpecialAPI {
     description: "The `unwrap` function attempts to 'unpack' its argument: if the argument is
 an option type, and the argument is a `(some ...)` option, this function returns the inner value of the
 option. If the argument is a response type, and the argument is an `(ok ...)` response, it returns
- the inner value of the `ok`. If the supplied argument is either an `(err ...)` or a `(none)` value,
+ the inner value of the `ok`. If the supplied argument is either an `(err ...)` or a `none` value,
 `unwrap` throws a runtime error, aborting any further processing of the current transaction.",
     example: "
 (define-map names-map { name: (string-ascii 12) } { id: int })
@@ -1588,7 +1627,7 @@ const DEFAULT_TO_API: SpecialAPI = SpecialAPI {
     output_type: "A",
     signature: "(default-to default-value option-value)",
     description: "The `default-to` function attempts to 'unpack' the second argument: if the argument is
-a `(some ...)` option, it returns the inner value of the option. If the second argument is a `(none)` value,
+a `(some ...)` option, it returns the inner value of the option. If the second argument is a `none` value,
 `default-to` it returns the value of `default-value`.",
     example: "
 (define-map names-map { name: (string-ascii 12) } { id: int })
@@ -1648,7 +1687,7 @@ const IS_NONE_API: SpecialAPI = SpecialAPI {
     output_type: "bool",
     signature: "(is-none value)",
     description:
-        "`is-none` tests a supplied option value, returning `true` if the option value is `(none)`,
+        "`is-none` tests a supplied option value, returning `true` if the option value is `none`,
 and `false` if it is a `(some ...)`.",
     example: "
 (define-map names-map { name: (string-ascii 12) } { id: int })
@@ -1768,7 +1807,7 @@ The `addrs` list contains the same PoX address values passed into the PoX smart 
 
 const PRINCIPAL_CONSTRUCT_API: SpecialAPI = SpecialAPI {
     input_type: "(buff 1), (buff 20), [(string-ascii 40)]",
-    output_type: "(response principal { error_code: uint, principal: (option principal) })",
+    output_type: "(response principal { error_code: uint, value: (optional principal) })",
     snippet: "principal-construct? ${1:version} ${2:pub-key-hash}",
     signature: "(principal-construct? (buff 1) (buff 20) [(string-ascii 40)])",
     description: "A principal value represents either a set of keys, or a smart contract.
@@ -1800,7 +1839,7 @@ however, then the `value` will be `none`.
 
 If the `version-byte` is a `buff` of length 0, if the single-byte `version-byte` is a
 value greater than `0x1f`, or the `hash-bytes` is a `buff` of length not equal to 20, then `error_code`
-will be `u1` and `value` will be `None`.
+will be `u1` and `value` will be `none`.
 
 If a name is given, and the name is either an empty string or contains ASCII characters
 that are not allowed in contract names, then `error_code` will be `u2`.
@@ -1996,7 +2035,7 @@ const DEFINE_TRAIT_API: DefineAPI = DefineAPI {
 can implement a given trait and then have their contract identifier being passed as a function argument in order to be called
 dynamically with `contract-call?`.
 
-Traits are defined with a name, and a list functions, defined with a name, a list of argument types, and return type.
+Traits are defined with a name, and a list of functions, where each function is defined with a name, a list of argument types, and a return type.
 
 In Clarity 1, a trait type can be used to specify the type of a function parameter. A parameter with a trait type can
 be used as the target of a dynamic `contract-call?`. A principal literal (e.g. `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM.foo`)
@@ -2077,7 +2116,8 @@ type defined using `define-fungible-token`. The increased token balance is _not_
 rather minted.  
 
 If a non-positive amount is provided to mint, this function returns `(err 1)`. Otherwise, on successfuly mint, it
-returns `(ok true)`.
+returns `(ok true)`. If this call would result in more supplied tokens than defined by the total supply in 
+`define-fungible-token`, then a `SupplyOverflow` runtime error is thrown.
 ",
     example: "
 (define-fungible-token stackaroo)
@@ -2094,11 +2134,9 @@ const MINT_ASSET: SpecialAPI = SpecialAPI {
 The asset must have been defined using `define-non-fungible-token`, and the supplied `asset-identifier` must be of the same type specified in
 that definition.
 
-If an asset identified by `asset-identifier` _already exists_, this function will return an error with the following error code:
+The function returns `(ok true)` if the mint is successful. This function may fail with the error code:
 
-`(err u1)`
-
-Otherwise, on successfuly mint, it returns `(ok true)`.
+* `(err u1)` -- an asset identified by `asset-identifier` _already exists_
 ",
     example: "
 (define-non-fungible-token stackaroo (string-ascii 40))
@@ -2148,9 +2186,9 @@ any user can transfer the assets. When used, relevant guards need to be added.
 This function returns (ok true) if the transfer is successful. In the event of an unsuccessful transfer it returns
 one of the following error codes:
 
-`(err u1)` -- `sender` does not have enough balance to transfer
-`(err u2)` -- `sender` and `recipient` are the same principal
-`(err u3)` -- amount to send is non-positive
+* `(err u1)` -- `sender` does not have enough balance to transfer
+* `(err u2)` -- `sender` and `recipient` are the same principal
+* `(err u3)` -- amount to send is non-positive
 ",
     example: "
 (define-fungible-token stackaroo)
@@ -2173,9 +2211,9 @@ When used, relevant guards need to be added.
 This function returns (ok true) if the transfer is successful. In the event of an unsuccessful transfer it returns
 one of the following error codes:
 
-`(err u1)` -- `sender` does not own the asset
-`(err u2)` -- `sender` and `recipient` are the same principal
-`(err u3)` -- asset identified by asset-identifier does not exist
+* `(err u1)` -- `sender` does not own the asset
+* `(err u2)` -- `sender` and `recipient` are the same principal
+* `(err u3)` -- asset identified by asset-identifier does not exist
 ",
     example: "
 (define-non-fungible-token stackaroo (string-ascii 40))
@@ -2209,10 +2247,9 @@ const BURN_TOKEN: SpecialAPI = SpecialAPI {
 type defined using `define-fungible-token`. The decreased token balance is _not_ transfered to another principal, but
 rather destroyed, reducing the circulating supply.  
 
-On a successful burn, it returns `(ok true)`. In the event of an unsuccessful burn it
-returns one of the following error codes:
+On a successful burn, it returns `(ok true)`. The burn may fail with error code:
 
-`(err u1)` -- `sender` does not have enough balance to burn this amount or the amount specified is not positive
+* `(err u1)` -- `sender` does not have enough balance to burn this amount or the amount specified is not positive
 ",
     example: "
 (define-fungible-token stackaroo)
@@ -2233,8 +2270,8 @@ The asset must have been defined using `define-non-fungible-token`, and the supp
 On a successful burn, it returns `(ok true)`. In the event of an unsuccessful burn it
 returns one of the following error codes:
 
-`(err u1)` -- `sender` does not own the specified asset
-`(err u3)` -- the asset specified by `asset-identifier` does not exist
+* `(err u1)` -- `sender` does not own the specified asset
+* `(err u3)` -- the asset specified by `asset-identifier` does not exist
 ",
     example: "
 (define-non-fungible-token stackaroo (string-ascii 40))
@@ -2249,8 +2286,9 @@ const STX_GET_BALANCE: SimpleFunctionAPI = SimpleFunctionAPI {
     signature: "(stx-get-balance owner)",
     description: "`stx-get-balance` is used to query the STX balance of the `owner` principal.
 
-This function returns the STX balance, in microstacks (1 STX = 1,000,000 microstacks), of the
-`owner` principal. In the event that the `owner` principal isn't materialized, it returns 0.
+This function returns the (unlocked) STX balance, in microstacks (1 STX = 1,000,000 microstacks), of the
+`owner` principal. The result is the same as `(get unlocked (stx-account user))`. 
+In the event that the `owner` principal isn't materialized, it returns 0.
 ",
     example: "
 (stx-get-balance 'SZ2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKQ9H6DPR) ;; Returns u0
@@ -2286,10 +2324,10 @@ by debiting the `sender` principal by `amount`, specified in microstacks. The `s
 This function returns (ok true) if the transfer is successful. In the event of an unsuccessful transfer it returns
 one of the following error codes:
 
-`(err u1)` -- `sender` does not have enough balance to transfer
-`(err u2)` -- `sender` and `recipient` are the same principal
-`(err u3)` -- amount to send is non-positive
-`(err u4)` -- the `sender` principal is not the current `tx-sender`
+* `(err u1)` -- `sender` does not have enough balance to transfer
+* `(err u2)` -- `sender` and `recipient` are the same principal
+* `(err u3)` -- amount to send is non-positive
+* `(err u4)` -- the `sender` principal is not the current `tx-sender`
 ",
     example: r#"
 (as-contract
@@ -2324,12 +2362,12 @@ const STX_BURN: SimpleFunctionAPI = SimpleFunctionAPI {
 specified in microstacks, by destroying the STX. The `sender` principal _must_ be equal to the current
 context's `tx-sender`.
 
-This function returns (ok true) if the transfer is successful. In the event of an unsuccessful transfer it returns
+This function returns (ok true) if the burn is successful. In the event of an unsuccessful burn it returns
 one of the following error codes:
 
-`(err u1)` -- `sender` does not have enough balance to transfer
-`(err u3)` -- amount to send is non-positive
-`(err u4)` -- the `sender` principal is not the current `tx-sender`
+* `(err u1)` -- `sender` does not have enough balance to burn
+* `(err u3)` -- amount to burn is non-positive
+* `(err u4)` -- the `sender` principal is not the current `tx-sender`
 ",
     example: "
 (as-contract
@@ -2526,13 +2564,15 @@ pub fn make_api_reference(function: &NativeFunctions) -> FunctionAPI {
 }
 
 fn make_keyword_reference(variable: &NativeVariables) -> Option<KeywordAPI> {
-    let simple_api = match variable {
+    let keyword = match variable {
         NativeVariables::TxSender => TX_SENDER_KEYWORD.clone(),
         NativeVariables::ContractCaller => CONTRACT_CALLER_KEYWORD.clone(),
         NativeVariables::NativeNone => NONE_KEYWORD.clone(),
         NativeVariables::NativeTrue => TRUE_KEYWORD.clone(),
         NativeVariables::NativeFalse => FALSE_KEYWORD.clone(),
         NativeVariables::BlockHeight => BLOCK_HEIGHT.clone(),
+        NativeVariables::StacksBlockHeight => STACKS_BLOCK_HEIGHT_KEYWORD.clone(),
+        NativeVariables::TenureHeight => TENURE_HEIGHT_KEYWORD.clone(),
         NativeVariables::BurnBlockHeight => BURN_BLOCK_HEIGHT.clone(),
         NativeVariables::TotalLiquidMicroSTX => TOTAL_LIQUID_USTX_KEYWORD.clone(),
         NativeVariables::Regtest => REGTEST_KEYWORD.clone(),
@@ -2541,25 +2581,27 @@ fn make_keyword_reference(variable: &NativeVariables) -> Option<KeywordAPI> {
         NativeVariables::TxSponsor => TX_SPONSOR_KEYWORD.clone(),
     };
     Some(KeywordAPI {
-        name: simple_api.name,
-        snippet: simple_api.snippet,
-        output_type: simple_api.output_type,
-        description: simple_api.description,
-        example: simple_api.example,
-        version: variable.get_version(),
+        name: keyword.name,
+        snippet: keyword.snippet,
+        output_type: keyword.output_type,
+        description: keyword.description,
+        example: keyword.example,
+        min_version: variable.get_min_version(),
+        max_version: variable.get_max_version(),
     })
 }
 
 fn make_for_special(api: &SpecialAPI, function: &NativeFunctions) -> FunctionAPI {
     FunctionAPI {
-        name: function.get_name().to_string(),
+        name: function.get_name(),
         snippet: api.snippet.to_string(),
         input_type: api.input_type.to_string(),
         output_type: api.output_type.to_string(),
         signature: api.signature.to_string(),
         description: api.description.to_string(),
         example: api.example.to_string(),
-        version: function.get_version(),
+        min_version: function.get_min_version(),
+        max_version: function.get_max_version(),
     }
 }
 
@@ -2572,7 +2614,8 @@ fn make_for_define(api: &DefineAPI, name: String) -> FunctionAPI {
         signature: api.signature.to_string(),
         description: api.description.to_string(),
         example: api.example.to_string(),
-        version: ClarityVersion::Clarity1,
+        min_version: ClarityVersion::Clarity1,
+        max_version: None,
     }
 }
 
@@ -2597,20 +2640,18 @@ pub fn make_define_reference(define_type: &DefineFunctions) -> FunctionAPI {
 fn make_all_api_reference() -> ReferenceAPIs {
     let mut functions: Vec<_> = NativeFunctions::ALL
         .iter()
-        .map(|x| make_api_reference(x))
+        .map(make_api_reference)
         .collect();
     for data_type in DefineFunctions::ALL.iter() {
         functions.push(make_define_reference(data_type))
     }
     functions.sort_by(|x, y| x.name.cmp(&y.name));
 
-    let mut keywords = Vec::new();
-    for variable in NativeVariables::ALL.iter() {
-        let output = make_keyword_reference(variable);
-        if let Some(api_ref) = output {
-            keywords.push(api_ref)
-        }
-    }
+    let mut keywords: Vec<_> = NativeVariables::ALL
+        .iter()
+        .filter_map(make_keyword_reference)
+        .collect();
+
     keywords.sort_by(|x, y| x.name.cmp(&y.name));
 
     ReferenceAPIs {
@@ -2619,6 +2660,7 @@ fn make_all_api_reference() -> ReferenceAPIs {
     }
 }
 
+#[allow(clippy::expect_used)]
 pub fn make_json_api_reference() -> String {
     let api_out = make_all_api_reference();
     format!(
@@ -2629,39 +2671,33 @@ pub fn make_json_api_reference() -> String {
 
 #[cfg(test)]
 mod test {
-    use crate::vm::{
-        ast,
-        contexts::OwnedEnvironment,
-        database::{BurnStateDB, HeadersDB, STXBalance},
-        docs::get_output_type_string,
-        eval_all, execute,
-        types::{
-            signatures::{FunctionArgSignature, FunctionReturnsSignature, ASCII_40},
-            BufferLength, FunctionType, PrincipalData, SequenceSubtype, StringSubtype,
-            TypeSignature,
-        },
-        ClarityVersion, ContractContext, Error, GlobalContext, LimitedCostTracker,
-        QualifiedContractIdentifier, Value,
+    use stacks_common::address::AddressHashMode;
+    use stacks_common::consts::CHAIN_ID_TESTNET;
+    use stacks_common::types::chainstate::{
+        BlockHeaderHash, BurnchainHeaderHash, ConsensusHash, SortitionId, StacksAddress,
+        StacksBlockId, VRFSeed,
     };
-    use stacks_common::types::{StacksEpochId, PEER_VERSION_EPOCH_2_1};
+    use stacks_common::types::{Address, StacksEpochId, PEER_VERSION_EPOCH_2_1};
     use stacks_common::util::hash::hex_bytes;
 
-    use super::make_json_api_reference;
-    use super::{get_input_type_string, make_all_api_reference};
-    use crate::address::AddressHashMode;
-    use crate::types::chainstate::{SortitionId, StacksAddress, StacksBlockId};
-    use crate::types::Address;
+    use super::{get_input_type_string, make_all_api_reference, make_json_api_reference};
     use crate::vm::analysis::type_check;
-    use crate::vm::types::TupleData;
-    use crate::{types::chainstate::VRFSeed, vm::StacksEpoch};
-    use crate::{
-        types::chainstate::{BlockHeaderHash, BurnchainHeaderHash, ConsensusHash},
-        vm::database::{ClarityDatabase, MemoryBackingStore},
-    };
-
     use crate::vm::ast::ASTRules;
+    use crate::vm::contexts::OwnedEnvironment;
     use crate::vm::costs::ExecutionCost;
-    use stacks_common::consts::CHAIN_ID_TESTNET;
+    use crate::vm::database::{
+        BurnStateDB, ClarityDatabase, HeadersDB, MemoryBackingStore, STXBalance,
+    };
+    use crate::vm::docs::get_output_type_string;
+    use crate::vm::types::signatures::{FunctionArgSignature, FunctionReturnsSignature, ASCII_40};
+    use crate::vm::types::{
+        BufferLength, FunctionType, PrincipalData, SequenceSubtype, StringSubtype, TupleData,
+        TypeSignature,
+    };
+    use crate::vm::{
+        ast, eval_all, execute, ClarityVersion, ContractContext, Error, GlobalContext,
+        LimitedCostTracker, QualifiedContractIdentifier, StacksEpoch, Value,
+    };
 
     struct DocHeadersDB {}
     const DOC_HEADER_DB: DocHeadersDB = DocHeadersDB {};
@@ -2756,7 +2792,7 @@ mod test {
             Some(StacksEpoch {
                 epoch_id: StacksEpochId::Epoch21,
                 start_height: 0,
-                end_height: u64::max_value(),
+                end_height: u64::MAX,
                 block_limit: ExecutionCost::max_value(),
                 network_epoch: PEER_VERSION_EPOCH_2_1,
             })
@@ -2773,7 +2809,15 @@ mod test {
             u32::MAX
         }
 
+        fn get_v3_unlock_height(&self) -> u32 {
+            u32::MAX
+        }
+
         fn get_pox_3_activation_height(&self) -> u32 {
+            u32::MAX
+        }
+
+        fn get_pox_4_activation_height(&self) -> u32 {
             u32::MAX
         }
 
@@ -2904,7 +2948,7 @@ mod test {
                     .type_map
                     .as_ref()
                     .unwrap()
-                    .get_type(&analysis.expressions.last().unwrap())
+                    .get_type_expected(&analysis.expressions.last().unwrap())
                     .cloned(),
             );
         }
@@ -3054,9 +3098,10 @@ mod test {
                         let mut snapshot = e
                             .global_context
                             .database
-                            .get_stx_balance_snapshot_genesis(&docs_principal_id);
+                            .get_stx_balance_snapshot_genesis(&docs_principal_id)
+                            .unwrap();
                         snapshot.set_balance(balance);
-                        snapshot.save();
+                        snapshot.save().unwrap();
                         e.global_context
                             .database
                             .increment_ustx_liquid_supply(100000)
@@ -3166,7 +3211,7 @@ mod test {
                 TypeSignature::IntType,
                 TypeSignature::PrincipalType,
             ]),
-            ret.clone(),
+            ret,
         );
         result = get_input_type_string(&function_type);
         assert_eq!(result, "uint, uint | uint, int | uint, principal | principal, uint | principal, int | principal, principal | int, uint | int, int | int, principal");
@@ -3194,7 +3239,7 @@ mod test {
                 TypeSignature::IntType,
                 TypeSignature::PrincipalType,
             ],
-            ret.clone(),
+            ret,
         );
         result = get_input_type_string(&function_type);
         assert_eq!(result, "uint | int | principal");
@@ -3209,7 +3254,7 @@ mod test {
         result = get_input_type_string(&function_type);
         assert_eq!(result, "int, ...");
 
-        function_type = FunctionType::Variadic(TypeSignature::PrincipalType, ret.clone());
+        function_type = FunctionType::Variadic(TypeSignature::PrincipalType, ret);
         result = get_input_type_string(&function_type);
         assert_eq!(result, "principal, ...");
     }

@@ -14,15 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use chrono::prelude::*;
-use slog::{BorrowedKV, Drain, FnValue, Level, Logger, OwnedKVList, Record, KV};
-use slog_term::{CountingWriter, Decorator, RecordDecorator, Serializer};
-use std::env;
-use std::io;
 use std::io::Write;
 use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, SystemTime};
+use std::{env, io, thread};
+
+use chrono::prelude::*;
+use lazy_static::lazy_static;
+use slog::{BorrowedKV, Drain, FnValue, Level, Logger, OwnedKVList, Record, KV};
+use slog_term::{CountingWriter, Decorator, RecordDecorator, Serializer};
 
 lazy_static! {
     pub static ref LOGGER: Logger = make_logger();
@@ -52,7 +52,7 @@ fn print_msg_header(mut rd: &mut dyn RecordDecorator, record: &Record) -> io::Re
                 rd,
                 "[{:5}.{:06}]",
                 elapsed.as_secs(),
-                elapsed.subsec_nanos() / 1000
+                elapsed.subsec_micros()
             )?;
         }
         Some(ref format) => {
@@ -205,8 +205,8 @@ fn make_json_logger() -> Logger {
                       }),
     );
 
-    let drain = Mutex::new(slog_json::Json::default(std::io::stderr())).map(slog::Fuse);
-    let filtered_drain = slog::LevelFilter::new(drain, get_loglevel()).fuse();
+    let drain = Mutex::new(slog_json::Json::default(std::io::stderr()));
+    let filtered_drain = slog::LevelFilter::new(drain, get_loglevel()).ignore_res();
     slog::Logger::root(filtered_drain, def_keys)
 }
 
@@ -225,7 +225,7 @@ fn make_logger() -> Logger {
         let decorator = slog_term::PlainSyncDecorator::new(std::io::stderr());
         let atty = isatty(Stream::Stderr);
         let drain = TermFormat::new(decorator, pretty_print, debug, atty);
-        let logger = Logger::root(drain.fuse(), o!());
+        let logger = Logger::root(drain.ignore_res(), o!());
         logger
     }
 }
@@ -239,7 +239,7 @@ fn make_logger() -> Logger {
         let plain = slog_term::PlainSyncDecorator::new(slog_term::TestStdoutWriter);
         let isatty = isatty(Stream::Stdout);
         let drain = TermFormat::new(plain, false, debug, isatty);
-        let logger = Logger::root(drain.fuse(), o!());
+        let logger = Logger::root(drain.ignore_res(), o!());
         logger
     }
 }
@@ -247,10 +247,12 @@ fn make_logger() -> Logger {
 fn inner_get_loglevel() -> slog::Level {
     if env::var("STACKS_LOG_TRACE") == Ok("1".into()) {
         slog::Level::Trace
-    } else if env::var("STACKS_LOG_DEBUG") == Ok("1".into()) {
+    } else if env::var("STACKS_LOG_DEBUG") == Ok("1".into())
+        || env::var("BLOCKSTACK_DEBUG") == Ok("1".into())
+    {
         slog::Level::Debug
-    } else if env::var("BLOCKSTACK_DEBUG") == Ok("1".into()) {
-        slog::Level::Debug
+    } else if env::var("STACKS_LOG_CRITONLY") == Ok("1".into()) {
+        slog::Level::Critical
     } else {
         slog::Level::Info
     }
@@ -337,9 +339,8 @@ enum Stream {
     Stderr,
 }
 
-#[cfg(all(unix))]
+#[cfg(unix)]
 fn isatty(stream: Stream) -> bool {
-    extern crate libc;
     let fd = match stream {
         Stream::Stdout => libc::STDOUT_FILENO,
         Stream::Stderr => libc::STDERR_FILENO,

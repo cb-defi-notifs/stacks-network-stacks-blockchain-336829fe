@@ -1,22 +1,22 @@
-use stacks::address::AddressHashMode;
 use stacks::burnchains::BurnchainSigner;
 use stacks::chainstate::stacks::{
     StacksPrivateKey, StacksPublicKey, StacksTransactionSigner, TransactionAuth,
 };
-use stacks::types::chainstate::StacksAddress;
-use stacks::util::hash::{Hash160, Sha256Sum};
-use stacks::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
+use stacks_common::address::{
+    AddressHashMode, C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
+};
+use stacks_common::types::chainstate::StacksAddress;
+use stacks_common::util::hash::{Hash160, Sha256Sum};
+use stacks_common::util::secp256k1::{Secp256k1PrivateKey, Secp256k1PublicKey};
+use stacks_common::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
 
 use super::operations::BurnchainOpSigner;
-
-use stacks_common::address::{
-    C32_ADDRESS_VERSION_MAINNET_SINGLESIG, C32_ADDRESS_VERSION_TESTNET_SINGLESIG,
-};
 
 /// A wrapper around a node's seed, coupled with operations for using it
 #[derive(Clone)]
 pub struct Keychain {
     secret_state: Vec<u8>,
+    nakamoto_mining_key: Secp256k1PrivateKey,
 }
 
 impl Keychain {
@@ -45,10 +45,32 @@ impl Keychain {
         StacksPrivateKey::from_slice(&sk_bytes[..]).expect("FATAL: Keychain::make_secret_key_bytes() returned bytes that could not be parsed into a secp256k1 secret key!")
     }
 
-    /// Create a default keychain from the seed
+    /// Get the public key hash of the nakamoto mining key (i.e., Hash160(pubkey))
+    pub fn get_nakamoto_pkh(&self) -> Hash160 {
+        let pk = Secp256k1PublicKey::from_private(&self.nakamoto_mining_key);
+        Hash160::from_node_public_key(&pk)
+    }
+
+    /// Get the secret key of the nakamoto mining key
+    pub fn get_nakamoto_sk(&self) -> &Secp256k1PrivateKey {
+        &self.nakamoto_mining_key
+    }
+
+    /// Set the secret key of the nakamoto mining key
+    pub fn set_nakamoto_sk(&mut self, mining_key: Secp256k1PrivateKey) {
+        self.nakamoto_mining_key = mining_key;
+    }
+
+    /// Create a default keychain from the seed, with a default nakamoto mining key derived
+    ///  from the same seed (
     pub fn default(seed: Vec<u8>) -> Keychain {
+        let secret_state = Self::make_secret_key_bytes(&seed);
+        // re-hash secret_state to use as a default seed for the nakamoto mining key
+        let nakamoto_mining_key =
+            Secp256k1PrivateKey::from_seed(Sha256Sum::from_data(&secret_state).as_bytes());
         Keychain {
-            secret_state: Keychain::make_secret_key_bytes(&seed),
+            secret_state,
+            nakamoto_mining_key,
         }
     }
 
@@ -98,10 +120,10 @@ impl Keychain {
     /// `block_height` must be the _same_ block height called to make_vrf_keypair()
     pub fn generate_proof(&self, block_height: u64, bytes: &[u8; 32]) -> VRFProof {
         let (pk, sk) = self.make_vrf_keypair(block_height);
-        let proof = VRF::prove(&sk, &bytes.to_vec());
+        let proof = VRF::prove(&sk, bytes.as_ref());
 
         // Ensure that the proof is valid by verifying
-        let is_valid = match VRF::verify(&pk, &proof, &bytes.to_vec()) {
+        let is_valid = match VRF::verify(&pk, &proof, bytes.as_ref()) {
             Ok(v) => v,
             Err(_) => false,
         };
@@ -124,6 +146,11 @@ impl Keychain {
                "pubkey_hash" => %Hash160::from_node_public_key(&StacksPublicKey::from_private(&sk)).to_string()
         );
         sk
+    }
+
+    pub fn get_pub_key(&self) -> Secp256k1PublicKey {
+        let sk = self.get_secret_key();
+        StacksPublicKey::from_private(&sk)
     }
 
     /// Get the Stacks address for the inner secret state
@@ -190,25 +217,19 @@ impl Keychain {
 mod tests {
     use std::collections::HashMap;
 
-    use stacks::address::AddressHashMode;
     use stacks::burnchains::PrivateKey;
     use stacks::chainstate::stacks::{
-        StacksPrivateKey, StacksPublicKey, StacksTransactionSigner, TransactionAuth,
+        StacksPrivateKey, StacksPublicKey, StacksTransaction, StacksTransactionSigner,
+        TokenTransferMemo, TransactionAuth, TransactionPayload, TransactionPostConditionMode,
+        TransactionVersion,
     };
-    use stacks::types::chainstate::StacksAddress;
-    use stacks::util::hash::{Hash160, Sha256Sum};
-    use stacks::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
-
-    use crate::operations::BurnchainOpSigner;
+    use stacks_common::address::AddressHashMode;
+    use stacks_common::types::chainstate::StacksAddress;
+    use stacks_common::util::hash::{Hash160, Sha256Sum};
+    use stacks_common::util::vrf::{VRFPrivateKey, VRFProof, VRFPublicKey, VRF};
 
     use super::Keychain;
-
-    use stacks::chainstate::stacks::StacksTransaction;
-    use stacks::chainstate::stacks::TokenTransferMemo;
-    use stacks::chainstate::stacks::TransactionPayload;
-    use stacks::chainstate::stacks::TransactionPostConditionMode;
-    use stacks::chainstate::stacks::TransactionVersion;
-
+    use crate::operations::BurnchainOpSigner;
     use crate::stacks_common::types::Address;
 
     /// Legacy implementation; kept around for testing
@@ -350,9 +371,9 @@ mod tests {
             };
 
             // Generate the proof
-            let proof = VRF::prove(&vrf_sk, &bytes.to_vec());
+            let proof = VRF::prove(&vrf_sk, bytes.as_ref());
             // Ensure that the proof is valid by verifying
-            let is_valid = match VRF::verify(vrf_pk, &proof, &bytes.to_vec()) {
+            let is_valid = match VRF::verify(vrf_pk, &proof, bytes.as_ref()) {
                 Ok(v) => v,
                 Err(_) => false,
             };

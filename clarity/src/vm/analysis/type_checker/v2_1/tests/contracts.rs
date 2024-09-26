@@ -14,47 +14,33 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::convert::TryFrom;
 use std::fs::read_to_string;
 
-use assert_json_diff;
+use assert_json_diff::assert_json_eq;
 use serde_json;
+use stacks_common::types::StacksEpochId;
 
+use crate::vm::analysis::contract_interface_builder::build_contract_interface;
 use crate::vm::analysis::errors::CheckErrors;
 use crate::vm::analysis::type_checker::v2_1::tests::mem_type_check;
-use crate::vm::analysis::{contract_interface_builder::build_contract_interface, AnalysisDatabase};
-use crate::vm::analysis::{mem_type_check as mem_run_analysis, run_analysis, CheckResult};
+use crate::vm::analysis::{
+    mem_type_check as mem_run_analysis, run_analysis, AnalysisDatabase, CheckError, CheckResult,
+    ContractAnalysis,
+};
 use crate::vm::ast::parse;
+use crate::vm::costs::LimitedCostTracker;
 use crate::vm::database::MemoryBackingStore;
 use crate::vm::errors::Error;
+use crate::vm::tests::test_clarity_versions;
 use crate::vm::types::signatures::CallableSubtype;
 use crate::vm::types::{
     PrincipalData, QualifiedContractIdentifier, StandardPrincipalData, TypeSignature,
 };
-use crate::vm::ContractName;
-use crate::vm::{
-    analysis::{CheckError, ContractAnalysis},
-    costs::LimitedCostTracker,
-    ClarityVersion, SymbolicExpression,
-};
-use stacks_common::types::StacksEpochId;
+use crate::vm::{ClarityVersion, ContractName, SymbolicExpression};
 
 fn mem_type_check_v1(snippet: &str) -> CheckResult<(Option<TypeSignature>, ContractAnalysis)> {
     mem_run_analysis(snippet, ClarityVersion::Clarity1, StacksEpochId::latest())
 }
-
-#[template]
-#[rstest]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch2_05)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch21)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch22)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch23)]
-#[case(ClarityVersion::Clarity1, StacksEpochId::Epoch24)]
-#[case(ClarityVersion::Clarity2, StacksEpochId::Epoch24)]
-fn test_clarity_versions_contracts(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {}
 
 #[template]
 #[rstest]
@@ -95,6 +81,7 @@ pub fn type_check_version(
         LimitedCostTracker::new_free(),
         epoch,
         version,
+        false,
     )
     .map_err(|(e, _)| e)
 }
@@ -227,7 +214,10 @@ fn test_names_tokens_contracts_interface() {
     ";
 
     let contract_analysis = mem_type_check(INTERFACE_TEST_CONTRACT).unwrap().1;
-    let test_contract_json_str = build_contract_interface(&contract_analysis).serialize();
+    let test_contract_json_str = build_contract_interface(&contract_analysis)
+        .unwrap()
+        .serialize()
+        .unwrap();
     let test_contract_json: serde_json::Value =
         serde_json::from_str(&test_contract_json_str).unwrap();
 
@@ -443,7 +433,7 @@ fn test_names_tokens_contracts_interface() {
         "fungible_tokens": [],
         "non_fungible_tokens": [],
         "epoch": "Epoch21",
-        "clarity_version": "Clarity2"
+        "clarity_version": "Clarity3"
     }"#).unwrap();
 
     eprintln!("{}", test_contract_json_str);
@@ -451,7 +441,7 @@ fn test_names_tokens_contracts_interface() {
     assert_json_eq!(test_contract_json, test_contract_json_expected);
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn test_names_tokens_contracts(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let tokens_contract_id = QualifiedContractIdentifier::local("tokens").unwrap();
     let names_contract_id = QualifiedContractIdentifier::local("names").unwrap();
@@ -468,7 +458,7 @@ fn test_names_tokens_contracts(#[case] version: ClarityVersion, #[case] epoch: S
     .unwrap();
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn test_names_tokens_contracts_bad(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let broken_public = "
          (define-public (broken-cross-contract (name-hash (buff 20)) (name-price uint))
@@ -503,13 +493,7 @@ fn test_names_tokens_contracts_bad(#[case] version: ClarityVersion, #[case] epoc
     let err = db
         .execute(|db| type_check(&names_contract_id, &mut names_contract, db, true))
         .unwrap_err();
-    assert!(match &err.err {
-        &CheckErrors::TypeError(ref expected_type, ref actual_type) => {
-            eprintln!("Received TypeError on: {} {}", expected_type, actual_type);
-            format!("{} {}", expected_type, actual_type) == "uint bool"
-        }
-        _ => false,
-    });
+    assert!(matches!(err.err, CheckErrors::TypeError(_, _)));
 }
 
 #[test]
@@ -550,20 +534,16 @@ fn test_bad_map_usage() {
 
     for contract in tests.iter() {
         let err = mem_type_check(contract).unwrap_err();
-        assert!(match err.err {
-            CheckErrors::TypeError(_, _) => true,
-            _ => false,
-        });
+        assert!(matches!(err.err, CheckErrors::TypeError(_, _)));
     }
 
-    assert!(match mem_type_check(unhandled_option).unwrap_err().err {
-        // Bad arg to `+` causes a uniontype error
-        CheckErrors::UnionTypeError(_, _) => true,
-        _ => false,
-    });
+    assert!(matches!(
+        mem_type_check(unhandled_option).unwrap_err().err,
+        CheckErrors::UnionTypeError(_, _)
+    ));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn test_same_function_name(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let ca_id = QualifiedContractIdentifier::local("contract-a").unwrap();
     let cb_id = QualifiedContractIdentifier::local("contract-b").unwrap();
@@ -647,32 +627,26 @@ fn test_expects() {
     for unmatched_return_types in bad_return_types_tests.iter() {
         let err = mem_type_check(unmatched_return_types).unwrap_err();
         eprintln!("unmatched_return_types returned check error: {}", err);
-        assert!(match &err.err {
-            &CheckErrors::ReturnTypesMustMatch(_, _) => true,
-            _ => false,
-        })
+        assert!(matches!(err.err, CheckErrors::ReturnTypesMustMatch(_, _)));
     }
 
     let err = mem_type_check(bad_default_type).unwrap_err();
     eprintln!("bad_default_types returned check error: {}", err);
-    assert!(match &err.err {
-        &CheckErrors::DefaultTypesMustMatch(_, _) => true,
-        _ => false,
-    });
+    assert!(matches!(err.err, CheckErrors::DefaultTypesMustMatch(_, _)));
 
     let err = mem_type_check(notype_response_type).unwrap_err();
     eprintln!("notype_response_type returned check error: {}", err);
-    assert!(match &err.err {
-        &CheckErrors::CouldNotDetermineResponseErrType => true,
-        _ => false,
-    });
+    assert!(matches!(
+        err.err,
+        CheckErrors::CouldNotDetermineResponseErrType
+    ));
 
     let err = mem_type_check(notype_response_type_2).unwrap_err();
     eprintln!("notype_response_type_2 returned check error: {}", err);
-    assert!(match &err.err {
-        &CheckErrors::CouldNotDetermineResponseOkType => true,
-        _ => false,
-    });
+    assert!(matches!(
+        err.err,
+        CheckErrors::CouldNotDetermineResponseOkType
+    ));
 }
 
 /// Pass a trait to a trait parameter with the same type
@@ -1778,7 +1752,7 @@ fn call_versioned(
         .map_err(|e| e.to_string())
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let mut marf = MemoryBackingStore::new();
     let mut db = marf.as_analysis_db();
@@ -1793,7 +1767,7 @@ fn clarity_trait_experiments_impl(#[case] version: ClarityVersion, #[case] epoch
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use(#[case] version: ClarityVersion, #[case] epoch: StacksEpochId) {
     let mut marf = MemoryBackingStore::new();
     let mut db = marf.as_analysis_db();
@@ -1808,7 +1782,7 @@ fn clarity_trait_experiments_use(#[case] version: ClarityVersion, #[case] epoch:
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_empty_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1824,7 +1798,7 @@ fn clarity_trait_experiments_empty_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_duplicate_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1843,7 +1817,7 @@ fn clarity_trait_experiments_duplicate_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_undefined(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1860,7 +1834,7 @@ fn clarity_trait_experiments_use_undefined(
     ));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_circular(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1878,7 +1852,7 @@ fn clarity_trait_experiments_circular(
     assert!(err.starts_with("ASTError(ParseError { err: CircularReference([\"circular\"])"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_no_response(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1893,7 +1867,7 @@ fn clarity_trait_experiments_no_response(
     assert!(err.starts_with("DefineTraitBadSignature"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_out_of_order(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1909,7 +1883,7 @@ fn clarity_trait_experiments_out_of_order(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1920,14 +1894,14 @@ fn clarity_trait_experiments_double_trait(
     // Can we define a trait with two methods with the same name and different types?
     match db.execute(|db| load_versioned(db, "double-trait", version, epoch)) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl_double_trait_both(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1941,14 +1915,14 @@ fn clarity_trait_experiments_impl_double_trait_both(
         load_versioned(db, "impl-double-trait-both", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl_double_trait_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1964,14 +1938,14 @@ fn clarity_trait_experiments_impl_double_trait_1(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("BadTraitImplementation(\"double-method\", \"foo\")"))
         }
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl_double_trait_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -1985,14 +1959,14 @@ fn clarity_trait_experiments_impl_double_trait_2(
         load_versioned(db, "impl-double-trait-2", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2009,14 +1983,14 @@ fn clarity_trait_experiments_use_double_trait(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError(BoolType, UIntType)"))
         }
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_partial_double_trait_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2033,14 +2007,14 @@ fn clarity_trait_experiments_use_partial_double_trait_1(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError(BoolType, UIntType)"))
         }
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_partial_double_trait_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2055,14 +2029,14 @@ fn clarity_trait_experiments_use_partial_double_trait_2(
         load_versioned(db, "use-partial-double-trait-2", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_identical_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2073,14 +2047,14 @@ fn clarity_trait_experiments_identical_double_trait(
     // Can we define a trait with two methods with the same name and the same type?
     match db.execute(|db| load_versioned(db, "identical-double-trait", version, epoch)) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl_identical_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2094,14 +2068,14 @@ fn clarity_trait_experiments_impl_identical_double_trait(
         load_versioned(db, "impl-identical-double-trait", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_selfret_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2116,7 +2090,7 @@ fn clarity_trait_experiments_selfret_trait(
     assert!(err.starts_with("ASTError(ParseError { err: CircularReference([\"self-return\"])"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_math_trait_transitive_alias(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2136,7 +2110,7 @@ fn clarity_trait_experiments_use_math_trait_transitive_alias(
     assert!(err.starts_with("TraitReferenceUnknown(\"math-alias\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_math_trait_transitive_name(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2152,14 +2126,14 @@ fn clarity_trait_experiments_use_math_trait_transitive_name(
         load_versioned(db, "use-math-trait-transitive-name", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("TraitReferenceUnknown(\"math-alias\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_original_and_define_a_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2173,7 +2147,7 @@ fn clarity_trait_experiments_use_original_and_define_a_trait(
         load_versioned(db, "use-original-and-define-a-trait", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TraitMethodUnknown(\"a\", \"do-it\")"))
         }
@@ -2181,7 +2155,7 @@ fn clarity_trait_experiments_use_original_and_define_a_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_redefined_and_define_a_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2196,14 +2170,14 @@ fn clarity_trait_experiments_use_redefined_and_define_a_trait(
         load_versioned(db, "use-redefined-and-define-a-trait", version, epoch)
     }) {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("TraitMethodUnknown(\"a\", \"do-that\")"))
         }
         res => panic!("got {:?}", res),
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_a_trait_transitive_original(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2222,7 +2196,7 @@ fn clarity_trait_experiments_use_a_trait_transitive_original(
     assert!(err.starts_with("TraitMethodUnknown(\"a\", \"do-it\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_use_a_trait_transitive_redefined(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2242,7 +2216,7 @@ fn clarity_trait_experiments_use_a_trait_transitive_redefined(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_nested_traits(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2264,7 +2238,7 @@ fn clarity_trait_experiments_nested_traits(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_nested_trait_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2292,12 +2266,12 @@ fn clarity_trait_experiments_call_nested_trait_1(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError"))
         }
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_nested_trait_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2318,12 +2292,12 @@ fn clarity_trait_experiments_call_nested_trait_2(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError"))
         }
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_nested_trait_3_ok(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2344,12 +2318,12 @@ fn clarity_trait_experiments_call_nested_trait_3_ok(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError"))
         }
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_nested_trait_3_err(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2372,7 +2346,7 @@ fn clarity_trait_experiments_call_nested_trait_3_err(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_nested_trait_4(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2400,12 +2374,12 @@ fn clarity_trait_experiments_call_nested_trait_4(
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError"))
         }
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_impl_math_trait_incomplete(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2423,7 +2397,7 @@ fn clarity_trait_experiments_impl_math_trait_incomplete(
     assert!(err.starts_with("BadTraitImplementation(\"math\", \"sub\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_literal(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2443,7 +2417,7 @@ fn clarity_trait_experiments_trait_literal(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_pass_let_rename_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2462,7 +2436,7 @@ fn clarity_trait_experiments_pass_let_rename_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_literal_incomplete(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2481,7 +2455,7 @@ fn clarity_trait_experiments_trait_literal_incomplete(
     assert!(err.starts_with("BadTraitImplementation(\"math\", \"sub\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_let_rename_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2495,7 +2469,7 @@ fn clarity_trait_experiments_call_let_rename_trait(
         load_versioned(db, "call-let-rename-trait", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TraitReferenceUnknown(\"new-math-contract\")"))
         }
@@ -2503,7 +2477,7 @@ fn clarity_trait_experiments_call_let_rename_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_data_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2522,7 +2496,7 @@ fn clarity_trait_experiments_trait_data_1(
     assert!(err.starts_with("ASTError(ParseError { err: TraitReferenceNotAllowed"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_data_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2541,7 +2515,7 @@ fn clarity_trait_experiments_trait_data_2(
     assert!(err.starts_with("ASTError(ParseError { err: TraitReferenceNotAllowed"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_upcast_trait_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2557,14 +2531,14 @@ fn clarity_trait_experiments_upcast_trait_1(
             load_versioned(db, "upcast-trait-1", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(PrincipalType, TraitReferenceType"));
     } else {
         assert!(err.starts_with("TypeError(PrincipalType, CallableType"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_upcast_trait_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2583,7 +2557,7 @@ fn clarity_trait_experiments_upcast_trait_2(
     assert!(err.starts_with("TypeError(TupleType(TupleTypeSignature { \"val\": principal,}), TupleType(TupleTypeSignature { \"val\": <S1G2081040G2081040G2081040G208105NK8PE5.math-trait.math>,}))"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_upcast_trait_3(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2599,14 +2573,14 @@ fn clarity_trait_experiments_upcast_trait_3(
             load_versioned(db, "upcast-trait-3", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(PrincipalType, TraitReferenceType"));
     } else {
         assert!(err.starts_with("TypeError(PrincipalType, CallableType"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_return_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2625,7 +2599,7 @@ fn clarity_trait_experiments_return_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_upcast_renamed(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2641,14 +2615,14 @@ fn clarity_trait_experiments_upcast_renamed(
             load_versioned(db, "upcast-renamed", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(PrincipalType, TraitReferenceType"));
     } else {
         assert!(err.starts_with("TypeError(PrincipalType, CallableType"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_constant_call(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2663,7 +2637,7 @@ fn clarity_trait_experiments_constant_call(
         load_versioned(db, "constant-call", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TraitReferenceUnknown(\"principal-value\")"))
         }
@@ -2671,7 +2645,7 @@ fn clarity_trait_experiments_constant_call(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_constant_to_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2686,8 +2660,8 @@ fn clarity_trait_experiments_constant_to_trait(
         load_versioned(db, "constant-to-trait", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
-        Err(err) if epoch == StacksEpochId::Epoch2_05 => {
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
+        Err(err) if epoch <= StacksEpochId::Epoch2_05 => {
             assert!(err.starts_with("TypeError(TraitReferenceType"))
         }
         Err(err) if version == ClarityVersion::Clarity1 => {
@@ -2697,7 +2671,7 @@ fn clarity_trait_experiments_constant_to_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_constant_to_constant_call(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2713,8 +2687,8 @@ fn clarity_trait_experiments_constant_to_constant_call(
         load_versioned(db, "constant-to-constant-call", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
-        Err(err) if epoch == StacksEpochId::Epoch2_05 => {
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
+        Err(err) if epoch <= StacksEpochId::Epoch2_05 => {
             assert!(err.starts_with("TypeError(TraitReferenceType"))
         }
         Err(err) if version == ClarityVersion::Clarity1 => {
@@ -2724,7 +2698,7 @@ fn clarity_trait_experiments_constant_to_constant_call(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_literal_1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2741,7 +2715,7 @@ fn clarity_trait_experiments_downcast_literal_1(
             load_versioned(db, "downcast-literal-1", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         println!("err: {}", err);
         assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } }), PrincipalType)"));
     } else {
@@ -2749,7 +2723,7 @@ fn clarity_trait_experiments_downcast_literal_1(
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_literal_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2766,14 +2740,16 @@ fn clarity_trait_experiments_downcast_literal_2(
         })
         .unwrap_err();
     match version {
-        ClarityVersion::Clarity2 => assert!(err.starts_with("ExpectedCallableType(PrincipalType)")),
+        ClarityVersion::Clarity2 | ClarityVersion::Clarity3 => {
+            assert!(err.starts_with("ExpectedCallableType(PrincipalType)"))
+        }
         ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TraitReferenceUnknown(\"principal-value\")"))
         }
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_literal_3(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2792,7 +2768,7 @@ fn clarity_trait_experiments_downcast_literal_3(
     assert!(err.starts_with("TraitReferenceUnknown(\"p\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_trait_2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2809,14 +2785,14 @@ fn clarity_trait_experiments_downcast_trait_2(
             load_versioned(db, "downcast-trait-2", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } }), PrincipalType)"));
     } else {
         assert!(err.starts_with("TypeError(CallableType(Trait(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } })), PrincipalType)"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_trait_3(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2832,14 +2808,14 @@ fn clarity_trait_experiments_downcast_trait_3(
             load_versioned(db, "downcast-trait-3", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } }), PrincipalType)"));
     } else {
         assert!(err.starts_with("TypeError(CallableType(Trait(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } })), PrincipalType)"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_trait_4(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2855,14 +2831,14 @@ fn clarity_trait_experiments_downcast_trait_4(
             load_versioned(db, "downcast-trait-4", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } }), PrincipalType)"));
     } else {
         assert!(err.starts_with("TypeError(CallableType(Trait(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } })), PrincipalType)"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_downcast_trait_5(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2878,14 +2854,14 @@ fn clarity_trait_experiments_downcast_trait_5(
             load_versioned(db, "downcast-trait-5", version, epoch)
         })
         .unwrap_err();
-    if epoch == StacksEpochId::Epoch2_05 {
+    if epoch <= StacksEpochId::Epoch2_05 {
         assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } }), PrincipalType)"));
     } else {
         assert!(err.starts_with("TypeError(CallableType(Trait(TraitIdentifier { name: ClarityName(\"math\"), contract_identifier: QualifiedContractIdentifier { issuer: StandardPrincipalData(S1G2081040G2081040G2081040G208105NK8PE5), name: ContractName(\"math-trait\") } })), PrincipalType)"));
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_identical_trait_cast(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2900,8 +2876,8 @@ fn clarity_trait_experiments_identical_trait_cast(
         load_versioned(db, "identical-trait-cast", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
-        Err(err) if epoch == StacksEpochId::Epoch2_05 => {
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
+        Err(err) if epoch <= StacksEpochId::Epoch2_05 => {
             assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier"))
         }
         Err(err) if version == ClarityVersion::Clarity1 => {
@@ -2911,7 +2887,7 @@ fn clarity_trait_experiments_identical_trait_cast(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_cast(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2926,8 +2902,8 @@ fn clarity_trait_experiments_trait_cast(
         load_versioned(db, "trait-cast", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
-        Err(err) if epoch == StacksEpochId::Epoch2_05 => {
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
+        Err(err) if epoch <= StacksEpochId::Epoch2_05 => {
             assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier"))
         }
         Err(err) if version == ClarityVersion::Clarity1 => {
@@ -2937,7 +2913,7 @@ fn clarity_trait_experiments_trait_cast(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_cast_incompatible(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2955,17 +2931,19 @@ fn clarity_trait_experiments_trait_cast_incompatible(
         .unwrap_err();
     match version {
         ClarityVersion::Clarity1 => {
-            if epoch == StacksEpochId::Epoch2_05 {
+            if epoch <= StacksEpochId::Epoch2_05 {
                 assert!(err.starts_with("TypeError(TraitReferenceType(TraitIdentifier"))
             } else {
                 assert!(err.starts_with("TypeError(CallableType(Trait(TraitIdentifier"))
             }
         }
-        ClarityVersion::Clarity2 => assert!(err.starts_with("IncompatibleTrait")),
+        ClarityVersion::Clarity2 | ClarityVersion::Clarity3 => {
+            assert!(err.starts_with("IncompatibleTrait"))
+        }
     }
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_renamed_trait_cast(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -2984,7 +2962,7 @@ fn clarity_trait_experiments_renamed_trait_cast(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_readonly_use_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3003,7 +2981,7 @@ fn clarity_trait_experiments_readonly_use_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_readonly_pass_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3023,7 +3001,7 @@ fn clarity_trait_experiments_readonly_pass_trait(
 }
 
 // TODO: This should be allowed
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_readonly_call_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3042,7 +3020,7 @@ fn clarity_trait_experiments_readonly_call_trait(
 }
 
 // TODO: This should be allowed
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_readonly_static_call(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3062,7 +3040,7 @@ fn clarity_trait_experiments_readonly_static_call(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_readonly_static_call_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3081,7 +3059,7 @@ fn clarity_trait_experiments_readonly_static_call_trait(
     assert!(err.starts_with("WriteAttemptedInReadOnly"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_dyn_call_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3109,7 +3087,7 @@ fn clarity_trait_experiments_dyn_call_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_dyn_call_trait_partial(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3136,7 +3114,7 @@ fn clarity_trait_experiments_dyn_call_trait_partial(
     assert!(err.starts_with("BadTraitImplementation(\"math\", \"sub\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_dyn_call_not_implemented(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3163,7 +3141,7 @@ fn clarity_trait_experiments_dyn_call_not_implemented(
     assert!(err.starts_with("BadTraitImplementation(\"math\", \"add\")"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_use_principal(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3182,7 +3160,7 @@ fn clarity_trait_experiments_call_use_principal(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_return_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3210,7 +3188,7 @@ fn clarity_trait_experiments_call_return_trait(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_full_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3234,14 +3212,14 @@ fn clarity_trait_experiments_call_full_double_trait(
     });
     match result {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_call_partial_double_trait(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3265,14 +3243,14 @@ fn clarity_trait_experiments_call_partial_double_trait(
     });
     match result {
         Ok(_) if version == ClarityVersion::Clarity1 => (),
-        Err(err) if version == ClarityVersion::Clarity2 => {
+        Err(err) if version >= ClarityVersion::Clarity2 => {
             assert!(err.starts_with("DefineTraitDuplicateMethod(\"foo\")"))
         }
         res => panic!("got {:?}", res),
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_trait_recursion(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3301,7 +3279,7 @@ fn clarity_trait_experiments_trait_recursion(
 }
 
 // Additional tests using this framework
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_principals_list_to_traits_list(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3316,7 +3294,7 @@ fn clarity_trait_experiments_principals_list_to_traits_list(
         load_versioned(db, "list-of-principals", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
         Err(err) if version == ClarityVersion::Clarity1 => {
             assert!(err.starts_with("TypeError(SequenceType(ListType"))
         }
@@ -3324,7 +3302,7 @@ fn clarity_trait_experiments_principals_list_to_traits_list(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_traits_list_to_traits_list(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3344,7 +3322,7 @@ fn clarity_trait_experiments_traits_list_to_traits_list(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_mixed_list_to_traits_list(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3359,8 +3337,8 @@ fn clarity_trait_experiments_mixed_list_to_traits_list(
         load_versioned(db, "mixed-list", version, epoch)
     });
     match result {
-        Ok(_) if version == ClarityVersion::Clarity2 => (),
-        Err(err) if epoch == StacksEpochId::Epoch2_05 => {
+        Ok(_) if version >= ClarityVersion::Clarity2 => (),
+        Err(err) if epoch <= StacksEpochId::Epoch2_05 => {
             assert!(err.starts_with("TypeError(TraitReferenceType"))
         }
         Err(err) if version == ClarityVersion::Clarity1 => {
@@ -3370,7 +3348,7 @@ fn clarity_trait_experiments_mixed_list_to_traits_list(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_double_trait_method1_v1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3405,7 +3383,7 @@ fn clarity_trait_experiments_double_trait_method1_v1(
     assert!(err.starts_with("TypeError(BoolType, UIntType)"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_double_trait_method2_v1(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3441,7 +3419,7 @@ fn clarity_trait_experiments_double_trait_method2_v1(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_double_trait_method1_v1_v2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3476,7 +3454,7 @@ fn clarity_trait_experiments_double_trait_method1_v1_v2(
     assert!(err.starts_with("TypeError(BoolType, UIntType)"));
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_double_trait_method2_v1_v2(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,
@@ -3512,7 +3490,14 @@ fn clarity_trait_experiments_double_trait_method2_v1_v2(
     };
 }
 
-#[apply(test_clarity_versions_contracts)]
+#[cfg(test)]
+impl From<CheckErrors> for String {
+    fn from(o: CheckErrors) -> Self {
+        o.to_string()
+    }
+}
+
+#[apply(test_clarity_versions)]
 fn clarity_trait_experiments_cross_epochs(
     #[case] version: ClarityVersion,
     #[case] epoch: StacksEpochId,

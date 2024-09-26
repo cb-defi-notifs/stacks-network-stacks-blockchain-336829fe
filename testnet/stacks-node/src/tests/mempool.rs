@@ -1,37 +1,35 @@
-use std::convert::From;
-use std::convert::TryFrom;
 use std::sync::Mutex;
 
+use clarity::vm::costs::ExecutionCost;
+use clarity::vm::database::NULL_BURN_STATE_DB;
+use clarity::vm::representations::ContractName;
+use clarity::vm::types::{PrincipalData, QualifiedContractIdentifier, StandardPrincipalData};
+use clarity::vm::Value;
+use lazy_static::lazy_static;
+use stacks::chainstate::stacks::db::blocks::MemPoolRejection;
 use stacks::chainstate::stacks::{
-    db::blocks::MemPoolRejection, Error as ChainstateError, StacksBlockHeader,
-    StacksMicroblockHeader, StacksPrivateKey, StacksPublicKey, StacksTransaction,
-    StacksTransactionSigner, TokenTransferMemo, TransactionAuth, TransactionPayload,
-    TransactionSpendingCondition, TransactionVersion, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
+    Error as ChainstateError, StacksBlockHeader, StacksMicroblockHeader, StacksPrivateKey,
+    StacksPublicKey, StacksTransaction, StacksTransactionSigner, TokenTransferMemo,
+    TransactionAnchorMode, TransactionAuth, TransactionPayload, TransactionSpendingCondition,
+    TransactionVersion, C32_ADDRESS_VERSION_MAINNET_SINGLESIG,
 };
 use stacks::codec::StacksMessageCodec;
 use stacks::core::mempool::MemPoolDB;
-use stacks::core::CHAIN_ID_TESTNET;
+use stacks::core::{StacksEpochId, CHAIN_ID_TESTNET};
 use stacks::cost_estimates::metrics::UnitMetric;
 use stacks::cost_estimates::UnitEstimator;
 use stacks::net::Error as NetError;
-use stacks::types::chainstate::{BlockHeaderHash, StacksAddress};
-use stacks::util::{hash::*, secp256k1::*};
-use stacks::vm::database::NULL_BURN_STATE_DB;
-use stacks::vm::{
-    representations::ContractName, types::PrincipalData, types::QualifiedContractIdentifier,
-    types::StandardPrincipalData, Value,
-};
-use stacks::{address::AddressHashMode, chainstate::stacks::TransactionAnchorMode};
-
-use crate::helium::RunLoop;
-use crate::Keychain;
-use stacks::core::StacksEpochId;
-use stacks::vm::costs::ExecutionCost;
+use stacks_common::address::AddressHashMode;
+use stacks_common::types::chainstate::{BlockHeaderHash, StacksAddress};
+use stacks_common::util::hash::*;
+use stacks_common::util::secp256k1::*;
 
 use super::{
     make_coinbase, make_contract_call, make_contract_publish, make_poison, make_stacks_transfer,
     serialize_sign_standard_single_sig_tx_anchor_mode_version, to_addr, SK_1, SK_2,
 };
+use crate::helium::RunLoop;
+use crate::Keychain;
 
 const FOO_CONTRACT: &'static str = "(define-public (foo) (ok 1))
                                     (define-public (bar (x uint)) (ok x))";
@@ -228,7 +226,11 @@ fn mempool_setup_chainstate() {
                 let consensus_hash = &block_header.consensus_hash;
                 let block_hash = &block_header.anchored_header.block_hash();
 
-                let micro_pubkh = &block_header.anchored_header.microblock_pubkey_hash;
+                let micro_pubkh = &block_header
+                    .anchored_header
+                    .as_stacks_epoch2()
+                    .unwrap()
+                    .microblock_pubkey_hash;
 
                 // let's throw some transactions at it.
                 // first a couple valid ones:
@@ -696,13 +698,7 @@ fn mempool_setup_chainstate() {
                     )
                     .unwrap_err();
                 eprintln!("Err: {:?}", e);
-                assert!(
-                    if let MemPoolRejection::PoisonMicroblocksDoNotConflict = e {
-                        true
-                    } else {
-                        false
-                    }
-                );
+                assert!(matches!(e, MemPoolRejection::Other(_)));
 
                 let microblock_1 = StacksMicroblockHeader {
                     version: 0,
@@ -733,11 +729,7 @@ fn mempool_setup_chainstate() {
                     )
                     .unwrap_err();
                 eprintln!("Err: {:?}", e);
-                assert!(if let MemPoolRejection::InvalidMicroblocks = e {
-                    true
-                } else {
-                    false
-                });
+                assert!(matches!(e, MemPoolRejection::Other(_)));
 
                 let mut microblock_1 = StacksMicroblockHeader {
                     version: 0,
@@ -771,13 +763,7 @@ fn mempool_setup_chainstate() {
                     )
                     .unwrap_err();
                 eprintln!("Err: {:?}", e);
-                assert!(
-                    if let MemPoolRejection::NoAnchorBlockWithPubkeyHash(_) = e {
-                        true
-                    } else {
-                        false
-                    }
-                );
+                assert!(matches!(e, MemPoolRejection::Other(_)));
 
                 let tx_bytes = make_coinbase(&contract_sk, 5, 1000);
                 let tx =
@@ -840,7 +826,7 @@ fn mempool_setup_chainstate() {
                 let tx_bytes = make_poison(&contract_sk, 5, 1000, microblock_1, microblock_2);
                 let tx =
                     StacksTransaction::consensus_deserialize(&mut tx_bytes.as_slice()).unwrap();
-                chain_state
+                let e = chain_state
                     .will_admit_mempool_tx(
                         &NULL_BURN_STATE_DB,
                         consensus_hash,
@@ -848,7 +834,9 @@ fn mempool_setup_chainstate() {
                         &tx,
                         tx_bytes.len() as u64,
                     )
-                    .unwrap();
+                    .unwrap_err();
+                eprintln!("Err: {:?}", e);
+                assert!(matches!(e, MemPoolRejection::Other(_)));
 
                 let contract_id = QualifiedContractIdentifier::new(
                     StandardPrincipalData::from(contract_addr.clone()),
